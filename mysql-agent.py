@@ -139,7 +139,7 @@ def create_language_model() -> ChatGoogleGenerativeAI:
             temperature=0.0,  # Use greedy sampling for more consistent outputs
             max_output_tokens=4096,  # Allow longer responses for complex queries
             top_p=1.0,  # Use full probability mass for more precise responses
-            streaming=False,
+            disable_streaming=True,  # Changed from streaming=False to disable_streaming=True
             timeout=120,  # Increased timeout for complex queries
             max_retries=5,  # Increased retries
             google_api_key=api_key,
