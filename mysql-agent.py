@@ -139,7 +139,7 @@ def create_language_model() -> ChatGoogleGenerativeAI:
             temperature=0.0,  # Use greedy sampling for more consistent outputs
             max_output_tokens=4096,  # Allow longer responses for complex queries
             top_p=1.0,  # Use full probability mass for more precise responses
-            disable_streaming=True,  # Changed from streaming=False to disable_streaming=True
+            disable_streaming=False,  # Enable streaming for progressive responses
             timeout=120,  # Increased timeout for complex queries
             max_retries=5,  # Increased retries
             google_api_key=api_key,
@@ -317,18 +317,20 @@ def main() -> None:
         if len(sys.argv) > 1:
             query = " ".join(sys.argv[1:])
             try:
-                response = oracle.invoke({"input": query})
-                if isinstance(response, dict):
-                    if "output" in response:
-                        print("\n💡 Result:", response["output"])
-                    elif "intermediate_steps" in response:
-                        final_step = response["intermediate_steps"][-1]
-                        if isinstance(final_step, tuple) and len(final_step) > 1:
-                            print("\n💡 Result:", final_step[1])
-                        else:
-                            print("\n💡 Result:", response)
-                else:
-                    print("\n💡 Result:", response)
+                print("\n💡 Result: ", end="", flush=True)
+                for chunk in oracle.stream({"input": query}):
+                    if isinstance(chunk, dict):
+                        if "output" in chunk:
+                            print(chunk["output"], end="", flush=True)
+                        elif "intermediate_steps" in chunk:
+                            final_step = chunk["intermediate_steps"][-1]
+                            if isinstance(final_step, tuple) and len(final_step) > 1:
+                                print(final_step[1], end="", flush=True)
+                            else:
+                                print(chunk, end="", flush=True)
+                    else:
+                        print(chunk, end="", flush=True)
+                print()  # New line after streaming
             except Exception as e:
                 print(f"\n❌ Error: {e}")
                 sys.exit(1)
@@ -379,19 +381,21 @@ def main() -> None:
                         get_database_stats(db)
                         continue
                     
-                    # Process the query
-                    response = oracle.invoke({"input": query})
-                    if isinstance(response, dict):
-                        if "output" in response:
-                            print("\n💡 Result:", response["output"])
-                        elif "intermediate_steps" in response:
-                            final_step = response["intermediate_steps"][-1]
-                            if isinstance(final_step, tuple) and len(final_step) > 1:
-                                print("\n💡 Result:", final_step[1])
-                            else:
-                                print("\n💡 Result:", response)
-                    else:
-                        print("\n💡 Result:", response)
+                    # Process the query with streaming
+                    print("\n💡 Result: ", end="", flush=True)
+                    for chunk in oracle.stream({"input": query}):
+                        if isinstance(chunk, dict):
+                            if "output" in chunk:
+                                print(chunk["output"], end="", flush=True)
+                            elif "intermediate_steps" in chunk:
+                                final_step = chunk["intermediate_steps"][-1]
+                                if isinstance(final_step, tuple) and len(final_step) > 1:
+                                    print(final_step[1], end="", flush=True)
+                                else:
+                                    print(chunk, end="", flush=True)
+                        else:
+                            print(chunk, end="", flush=True)
+                    print()  # New line after streaming
                         
                 except KeyboardInterrupt:
                     print("\n\n👋 Farewell, seeker of knowledge!")
