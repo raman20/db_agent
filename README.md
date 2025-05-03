@@ -1,84 +1,134 @@
-# MySQL Agent: The Oracle of Data
+# Oracle: Your Intelligent Database Assistant
 
-A powerful and elegant SQL agent that transforms complex database operations into simple conversations. This agent is capable of handling any MySQL operation with grace and precision.
+Oracle is a powerful and friendly database assistant that helps you interact with your MySQL database through natural language. It understands your questions, translates them into SQL queries, and presents the results in a clear, readable format.
 
 ## Features
 
-- Natural language to SQL conversion
-- Interactive command-line interface
-- Support for all MySQL operations (SELECT, INSERT, UPDATE, DELETE, etc.)
-- Error handling and retry mechanisms
-- Database statistics and schema inspection
-- Connection pooling and timeout management
+- 🤖 Natural language interface for database queries
+- 📊 Interactive command-line interface
+- 🔍 Intelligent intent detection
+- 💡 Smart response formatting
+- 🛠️ Support for all MySQL operations
+- 🎯 Context-aware responses
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/mysql-agent.git
-cd mysql-agent
+git clone https://github.com/yourusername/oracle.git
+cd oracle
 ```
 
-2. Create a virtual environment (recommended):
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
+2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-## Configuration
-
-1. Create a `.env` file in the project root:
+3. Set up environment variables:
 ```bash
-DB_USERNAME=your_db_username
-DB_PASSWORD=your_db_password
-DB_HOST=localhost
-DB_PORT=3306
-DB_NAME=your_database
-GOOGLE_API_KEY=your_google_api_key
+cp .env.example .env
+# Edit .env with your database credentials
 ```
-
-2. Update the database configuration in `mysql-agent.py` if needed.
 
 ## Usage
 
-### Command Line Mode
-```bash
-python mysql-agent.py "your natural language query"
-```
-
 ### Interactive Mode
+
+Start the interactive CLI:
 ```bash
-python mysql-agent.py
+python main.py
 ```
 
-Available commands in interactive mode:
-- `help`: Show available commands
+Example interactions:
+```
+🌟 Welcome to Oracle, your intelligent database assistant!
+I'm here to help you explore and manage your database.
+Type 'help' to see what I can do, or ask me anything about your data.
+
+🤔 Your question: help
+
+📚 I can help you with your database in several ways:
+
+1. Basic Commands:
+   - tables: List all tables in the database
+   - schema <table>: Show schema of a specific table
+   - stats: Show database statistics
+
+2. Ask Questions About Your Data:
+   - 'Show me all customers'
+   - 'How many orders do we have?'
+   - 'What's the average order value?'
+   - 'Find customers who haven't ordered in 30 days'
+
+3. Data Analysis:
+   - 'Show me sales trends by month'
+   - 'What are our top selling products?'
+   - 'Which customers have the highest lifetime value?'
+
+4. Data Management:
+   - 'Add a new customer'
+   - 'Update customer information'
+   - 'Delete inactive records'
+
+🤖 I can also understand greetings and farewells!
+
+💡 Just ask me anything about your database, and I'll do my best to help!
+```
+
+### Command-Line Mode
+
+Run a single query:
+```bash
+python main.py "show me all customers"
+```
+
+## Project Structure
+
+```
+oracle/
+├── main.py           # Entry point of the application
+├── cli.py            # Command-line interface
+├── database.py       # Database connection and operations
+├── model.py          # Language model configuration
+├── agent.py          # Agent creation and management
+├── config.py         # Configuration and constants
+├── requirements.txt  # Project dependencies
+└── .env              # Environment variables
+```
+
+## Available Commands
+
 - `tables`: List all tables in the database
 - `schema <table>`: Show schema of a specific table
 - `stats`: Show database statistics
+- `help`: Show help information
 - `exit`: Quit the program
 
-## Examples
+## Environment Variables
 
-```bash
-# List all customers
-python mysql-agent.py "Show me all customers"
-
-# Add a new customer
-python mysql-agent.py "Add a new customer named John Smith with phone 555-1234"
-
-# Get database statistics
-python mysql-agent.py "stats"
+Create a `.env` file with the following variables:
 ```
+DB_USERNAME=your_username
+DB_PASSWORD=your_password
+DB_HOST=localhost
+DB_PORT=3306
+DB_NAME=your_database
+GOOGLE_API_KEY=your_api_key
+```
+
+## Requirements
+
+- Python 3.8+
+- MySQL 5.7+
+- Google API key for Gemini model
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
@@ -86,6 +136,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- Built with [LangChain](https://www.langchain.com/)
-- Powered by [Google's Gemini](https://ai.google.dev/)
-- Database operations handled by [SQLAlchemy](https://www.sqlalchemy.org/) 
+- Built with Python and LangChain
+- Powered by Google's Gemini model
+- Inspired by the need for better database interaction 
