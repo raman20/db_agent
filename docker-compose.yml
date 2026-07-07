@@ -1,0 +1,31 @@
+services:
+  schemapilot-mysql:
+    image: mysql:8.0
+    container_name: schemapilot-mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password_abc_123
+      MYSQL_DATABASE: schemapilot_db
+      MYSQL_USER: schemapilot_user
+      MYSQL_PASSWORD: schemapilot_password_xyz
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  schemapilot-postgres:
+    image: postgres:15
+    container_name: schemapilot-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: schemapilot_db
+      POSTGRES_USER: schemapilot_user
+      POSTGRES_PASSWORD: schemapilot_password_xyz
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  mysql_data:
+  postgres_data:

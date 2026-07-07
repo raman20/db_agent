@@ -40,3 +40,9 @@ env/
 # Database
 *.db
 *.sqlite3 
+
+# Local Data
+data/
+build/
+dist/
+*.egg-info/

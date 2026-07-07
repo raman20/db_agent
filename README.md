@@ -1,141 +1,132 @@
-# Oracle: Your Intelligent Database Assistant
+# SchemaPilot
 
-Oracle is a powerful and friendly database assistant that helps you interact with your MySQL database through natural language. It understands your questions, translates them into SQL queries, and presents the results in a clear, readable format.
+SchemaPilot is an interactive, local-only terminal CLI copilot for relational databases. It translates natural language questions into secure, optimized SQL, executes them against your target database, and returns formatted analysis and tabular results directly in your console. 
 
-## Features
+It is designed to run completely on your local machine, using either cloud LLMs (Gemini, OpenAI, Claude) or local offline models (Ollama, LlamaEdge) without requiring any web server wrappers.
 
-- 🤖 Natural language interface for database queries
-- 📊 Interactive command-line interface
-- 🔍 Intelligent intent detection
-- 💡 Smart response formatting
-- 🛠️ Support for all MySQL operations
-- 🎯 Context-aware responses
+## Core Features
 
-## Installation
+* **Interactive REPL Shell:** A persistent query shell with up/down arrow command history search (backed by `prompt_toolkit`).
+* **Global Model Profiles:** Manage credentials for multiple LLMs and switch active models dynamically.
+* **Global Database Profiles:** Manage credentials for MySQL, PostgreSQL, and SQLite databases.
+* **AST SQL Security Sentry:** Validates query safety prior to execution using Abstract Syntax Tree (AST) analysis via `sqlglot` to block destructive DDL/DML mutations.
+* **Dynamic Step Log Spinner:** Employs `rich` console status spinners to track agent states (Architect, Programmer, Sentry, Executor, Analyst) in real time.
+* **Formatted Outputs:** Visualizes database queries using SQL syntax-highlighting panels, markdown tables, and formatted terminal data grids.
 
-1. Clone the repository:
+---
+
+## Directory Layout
+
+```
+schema-pilot/
+├── schemapilot/           # Core library package
+│   ├── __init__.py
+│   ├── config.py          # Environment defaults
+│   ├── db.py              # Connections registry (~/.config/schemapilot/connections.json)
+│   ├── security.py        # SQL AST validation rules
+│   ├── llm.py             # LLM profiles registry (~/.config/schemapilot/models.json)
+│   └── agent.py           # SQL generation and evaluation pipeline
+├── tests/                 # Unit tests
+│   └── test_security.py   # Security AST test suite
+├── cli.py                 # CLI entrypoint driver
+├── pyproject.toml         # Python packaging metadata (PEP 517/621)
+├── requirements.txt       # Project dependencies
+├── Makefile               # Task runner definitions
+└── docker-compose.yml     # Local database sandboxes (MySQL, Postgres)
+```
+
+---
+
+## Setup & Quickstart
+
+### 1. Initialize Sandbox Databases
+Spin up the PostgreSQL and MySQL sandbox containers:
 ```bash
-git clone https://github.com/yourusername/oracle.git
-cd oracle
+make sandbox
 ```
 
-2. Install dependencies:
+### 2. Local Installation
+Install the project in editable mode to register the `schemapilot` binary globally in your shell path:
 ```bash
-pip install -r requirements.txt
+make install
 ```
 
-3. Set up environment variables:
+### 3. Add a Database Connection Profile
+Configure a connection profile for PostgreSQL, MySQL, or SQLite:
 ```bash
-cp .env.example .env
-# Edit .env with your database credentials
+schemapilot --add-conn
 ```
+*Follow the interactive prompt. On save, SchemaPilot will automatically test database connectivity.*
 
-## Usage
-
-### Interactive Mode
-
-Start the interactive CLI:
+### 4. Add an AI Model Profile
+Add credentials for Gemini, OpenAI, Claude, or a local Ollama server:
 ```bash
-python main.py
+schemapilot --add-model
 ```
 
-Example interactions:
-```
-🌟 Welcome to Oracle, your intelligent database assistant!
-I'm here to help you explore and manage your database.
-Type 'help' to see what I can do, or ask me anything about your data.
-
-🤔 Your question: help
-
-📚 I can help you with your database in several ways:
-
-1. Basic Commands:
-   - tables: List all tables in the database
-   - schema <table>: Show schema of a specific table
-   - stats: Show database statistics
-
-2. Ask Questions About Your Data:
-   - 'Show me all customers'
-   - 'How many orders do we have?'
-   - 'What's the average order value?'
-   - 'Find customers who haven't ordered in 30 days'
-
-3. Data Analysis:
-   - 'Show me sales trends by month'
-   - 'What are our top selling products?'
-   - 'Which customers have the highest lifetime value?'
-
-4. Data Management:
-   - 'Add a new customer'
-   - 'Update customer information'
-   - 'Delete inactive records'
-
-🤖 I can also understand greetings and farewells!
-
-💡 Just ask me anything about your database, and I'll do my best to help!
-```
-
-### Command-Line Mode
-
-Run a single query:
+### 5. Switch Active Profiles
 ```bash
-python main.py "show me all customers"
+# Toggle active database connections
+schemapilot --list-conns
+schemapilot --select-conn <connection_id>
+
+# Toggle active model configurations
+schemapilot --list-models
+schemapilot --select-model <model_id>
 ```
 
-## Project Structure
+---
 
-```
-oracle/
-├── main.py           # Entry point of the application
-├── cli.py            # Command-line interface
-├── database.py       # Database connection and operations
-├── model.py          # Language model configuration
-├── agent.py          # Agent creation and management
-├── config.py         # Configuration and constants
-├── requirements.txt  # Project dependencies
-└── .env              # Environment variables
+## Usage Examples
+
+### Natural Language Queries
+Execute a single query against your active connection:
+```bash
+schemapilot "Show total orders by month"
 ```
 
-## Available Commands
-
-- `tables`: List all tables in the database
-- `schema <table>`: Show schema of a specific table
-- `stats`: Show database statistics
-- `help`: Show help information
-- `exit`: Quit the program
-
-## Environment Variables
-
-Create a `.env` file with the following variables:
-```
-DB_USERNAME=your_username
-DB_PASSWORD=your_password
-DB_HOST=localhost
-DB_PORT=3306
-DB_NAME=your_database
-GOOGLE_API_KEY=your_api_key
+### Interactive Console
+Start the persistent prompt shell:
+```bash
+schemapilot
 ```
 
-## Requirements
+### Direct Arguments Override
+Override active profile configurations for a single execution:
+```bash
+schemapilot --provider openai --model gpt-4o --api-key sk-proj-12345 "List all tables"
+```
 
-- Python 3.8+
-- MySQL 5.7+
-- Google API key for Gemini model
+---
 
-## Contributing
+## CLI Reference
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+```text
+positional arguments:
+  query                 Single natural language query to execute
 
-## License
+options:
+  -h, --help            show this help message and exit
+  --add-conn            Interactively add and test a new database profile link
+  --list-conns          List all saved database connection profiles
+  --select-conn CONN_ID Set the active database profile by its ID
+  --delete-conn CONN_ID Delete a database connection profile by its ID
+  --add-model           Interactively add a new AI model profile configuration
+  --list-models         List all saved AI model configurations
+  --select-model MODEL_ID Set the active AI model profile by its ID
+  --delete-model MODEL_ID Delete an AI model profile configuration by its ID
+  --save-llm            Persist model settings passed as command overrides
+  --provider PROVIDER   AI provider override (google, openai, anthropic, local)
+  --model MODEL         AI model name override (e.g. gemini-2.0-flash, gpt-4o)
+  --api-key API_KEY     API authentication key override
+  --base-url BASE_URL   Local server endpoint base URL override (Ollama / LM Studio)
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+---
 
-## Acknowledgments
+## Development & Testing
 
-- Built with Python and LangChain
-- Powered by Google's Gemini model
-- Inspired by the need for better database interaction 
+Run the security sentinel test suite:
+```bash
+PYTHONPATH=. pytest
+```
