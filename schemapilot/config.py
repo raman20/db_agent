@@ -32,6 +32,9 @@ class Settings(BaseModel):
     # thousands); MAX_PROMPT_TABLES caps how many of them reach the LLM prompt.
     CATALOG_MAX_TABLES: int = Field(default_factory=lambda: int(os.getenv("CATALOG_MAX_TABLES", "60")))
     MAX_PROMPT_TABLES: int = Field(default_factory=lambda: int(os.getenv("MAX_PROMPT_TABLES", "12")))
+    # ANALYST_SAMPLE_ROWS caps how many result rows the analyst prompt carries: summarising a
+    # 50k-row result set does not need the whole set, just a sample plus the true row count.
+    ANALYST_SAMPLE_ROWS: int = Field(default_factory=lambda: int(os.getenv("ANALYST_SAMPLE_ROWS", "30")))
     
     # Security Settings
     ALLOW_MUTATING_QUERIES: bool = Field(default_factory=lambda: os.getenv("ALLOW_MUTATING_QUERIES", "false").lower() == "true")
