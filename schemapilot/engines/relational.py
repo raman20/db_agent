@@ -36,6 +36,10 @@ MYSQL = EngineSpec(
     connection_fields=("host", "port", "username", "password", "database"),
     quote_char="`",
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC"}),
+    # No "Pragma": MySQL has no PRAGMA statement, so `PRAGMA ...` here is either nonsense or an
+    # attempt to smuggle SQLite/DuckDB syntax past the sentry. Overridden rather than removed
+    # from the default because SQLite and DuckDB do support it.
+    readonly_nodes=frozenset({"Show", "Describe"}),
     system_schemas=frozenset({"information_schema", "mysql", "performance_schema", "sys"}),
     dangerous_functions=_FILESYSTEM_FUNCS,
 )
