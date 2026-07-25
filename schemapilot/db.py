@@ -1,65 +1,23 @@
 import json
 import logging
 import os
-import stat
-import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import NoSuchModuleError
-from langchain_community.utilities.sql_database import SQLDatabase
 
 from schemapilot.config import settings
 from schemapilot.engines import EngineSpec, get_spec
+from schemapilot.paths import USER_CONFIG_DIR, ensure_config_dir, write_credential_json
 
 logger = logging.getLogger("schemapilot.db")
 
-# Store configuration files in the user's home configuration directory (standard global CLI practice)
-USER_CONFIG_DIR = os.path.expanduser("~/.config/schemapilot")
+# USER_CONFIG_DIR, ensure_config_dir and write_credential_json are owned by schemapilot.paths and
+# re-exported here only so existing `monkeypatch.setattr(db, "USER_CONFIG_DIR", ...)` targets keep
+# resolving. Repointing this alias does NOT move where files are written -- patch
+# schemapilot.paths.USER_CONFIG_DIR (or CONNECTIONS_FILE below) for that.
 CONNECTIONS_FILE = os.path.join(USER_CONFIG_DIR, "connections.json")
-
-# connections.json and models.json hold plaintext database passwords and LLM API keys, so the
-# directory is owner-only and the files are written 0600 instead of inheriting the process umask
-# (which typically yields world-readable 0644). OS keyring storage is future work.
-CONFIG_DIR_MODE = 0o700
-CREDENTIAL_FILE_MODE = 0o600
-
-
-def ensure_config_dir(directory: str = USER_CONFIG_DIR) -> str:
-    """Creates the config directory 0700, tightening the mode if it already exists laxer."""
-    os.makedirs(directory, mode=CONFIG_DIR_MODE, exist_ok=True)
-    try:
-        if stat.S_IMODE(os.stat(directory).st_mode) != CONFIG_DIR_MODE:
-            os.chmod(directory, CONFIG_DIR_MODE)
-    except OSError as e:  # pragma: no cover - platform/permission dependent
-        logger.debug(f"Could not tighten permissions on {directory}: {e}")
-    return directory
-
-
-def write_credential_json(path: str, payload: Any):
-    """Writes JSON credentials atomically with 0600 permissions.
-
-    Atomic because a half-written connections.json is unrecoverable: the temp file lives in the
-    same directory (so os.replace never crosses a filesystem boundary) and only replaces the
-    original once it is completely flushed, leaving the previous file intact if we die midway.
-    """
-    directory = os.path.dirname(path) or "."
-    ensure_config_dir(directory)
-
-    fd, tmp_path = tempfile.mkstemp(prefix=".{}.".format(os.path.basename(path)), dir=directory)
-    try:
-        os.fchmod(fd, CREDENTIAL_FILE_MODE)
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, indent=4)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except Exception:
-        # Never leave the temp file behind; the original stays untouched.
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
 
 
 class DatabaseManager:
@@ -71,7 +29,6 @@ class DatabaseManager:
 
     def __init__(self):
         self.engine = None
-        self.langchain_db = None
         self.active_id = None
         self.connections = {}
         self.load_connections()
@@ -196,7 +153,6 @@ class DatabaseManager:
             except Exception as e:  # pragma: no cover - dispose rarely fails
                 logger.debug(f"Engine dispose failed: {e}")
         self.engine = None
-        self.langchain_db = None
 
     def test_connection(self, config: Dict[str, Any]) -> Tuple[bool, str]:
         """Tests database connection parameters without saving them."""
@@ -234,11 +190,6 @@ class DatabaseManager:
             logger.info(f"Connecting to database '{conn_id}' using engine: {spec.name}")
             candidate = self._create_engine(config, spec)
             self._probe(candidate, spec)
-            candidate_langchain_db = SQLDatabase(
-                candidate,
-                sample_rows_in_table_info=3,
-                max_string_length=1000,
-            )
         except Exception as e:
             # Nothing has been swapped, so only the candidate needs cleaning up.
             if candidate is not None:
@@ -253,11 +204,12 @@ class DatabaseManager:
                 raise
             raise ConnectionError(f"Database connection failed: {e}")
 
-        # The candidate is proven usable; swap all four pieces of state together so that
-        # active_id, active_spec, active_config, engine and langchain_db can never disagree.
+        # The candidate is proven usable; swap engine and active_id together so that engine,
+        # active_id, active_spec and active_config can never disagree (the latter two are derived
+        # from active_id, so assigning it last would still be observable mid-swap by nothing --
+        # there is no yield point between these two statements).
         previous_engine = self.engine
         self.engine = candidate
-        self.langchain_db = candidate_langchain_db
         self.active_id = conn_id
 
         # Only now release the old pool: otherwise switching connections leaks a live pool per
@@ -301,12 +253,6 @@ class DatabaseManager:
             logger.warning(f"Could not auto-connect to '{target}': {e}")
 
     # ------------------------------------------------------------------ queries
-
-    def get_tables(self) -> List[str]:
-        """Gets list of tables for active connection."""
-        if not self.langchain_db:
-            return []
-        return self.langchain_db.get_usable_table_names()
 
     def execute_query(self, query: str) -> Dict[str, Any]:
         """Executes a query on active connection and returns structured results."""

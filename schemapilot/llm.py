@@ -3,10 +3,13 @@ import json
 import logging
 from typing import Dict, Any, List
 
+from schemapilot.paths import USER_CONFIG_DIR, ensure_config_dir, write_credential_json
+
 logger = logging.getLogger("schemapilot.llm")
 
-# Store LLM profile configurations in user's home configuration directory (standard global CLI practice)
-USER_CONFIG_DIR = os.path.expanduser("~/.config/schemapilot")
+# USER_CONFIG_DIR is owned by schemapilot.paths; it is re-exported here only so existing
+# monkeypatch targets keep resolving. models.json holds plaintext API keys, so it goes through
+# the same 0700-directory / atomic-0600-file plumbing as connections.json.
 MODELS_FILE = os.path.join(USER_CONFIG_DIR, "models.json")
 
 class ModelProfileManager:
@@ -20,8 +23,6 @@ class ModelProfileManager:
 
     def load_profiles(self):
         """Loads saved profiles from models.json."""
-        from schemapilot.db import ensure_config_dir
-
         ensure_config_dir(os.path.dirname(MODELS_FILE))
         if os.path.exists(MODELS_FILE):
             try:
@@ -44,8 +45,6 @@ class ModelProfileManager:
         models.json holds plaintext LLM API keys, so it is written atomically with 0600 rather
         than inheriting the process umask (which typically yields world-readable 0644).
         """
-        from schemapilot.db import write_credential_json
-
         try:
             write_credential_json(MODELS_FILE, self.profiles)
         except Exception as e:

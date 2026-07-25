@@ -28,11 +28,15 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
 
     config_dir = home / ".config" / "schemapilot"
+
+    # schemapilot.paths owns the directory; db/llm own their own filenames. Patching paths is
+    # what actually redirects ensure_config_dir()'s default.
+    from schemapilot import llm as llm_module
+    from schemapilot import paths as paths_module
+
+    monkeypatch.setattr(paths_module, "USER_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(db_module, "USER_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(db_module, "CONNECTIONS_FILE", str(config_dir / "connections.json"))
-
-    from schemapilot import llm as llm_module
-
     monkeypatch.setattr(llm_module, "USER_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(llm_module, "MODELS_FILE", str(config_dir / "models.json"))
     return config_dir
@@ -445,8 +449,8 @@ def test_failed_switch_keeps_the_working_connection(tmp_path, isolated_config, m
     """A failed switch must be a no-op, not a downgrade to a half-broken state.
 
     The old ordering disposed the current engine before proving the candidate, so on failure
-    `active_id`/`active_spec` still named the old profile while `engine`/`langchain_db` were
-    None -- the REPL advertised an active connection that could not execute anything.
+    `active_id`/`active_spec` still named the old profile while `engine` was None -- the REPL
+    advertised an active connection that could not execute anything.
     """
     good = tmp_path / "good.db"
     engine = create_engine(f"sqlite:///{good}")
@@ -463,7 +467,7 @@ def test_failed_switch_keeps_the_working_connection(tmp_path, isolated_config, m
     manager.select_connection("good")
 
     working_engine = manager.engine
-    working_langchain_db = manager.langchain_db
+    working_uri = str(working_engine.url)
 
     monkeypatch.setattr(
         manager, "_probe",
@@ -473,14 +477,18 @@ def test_failed_switch_keeps_the_working_connection(tmp_path, isolated_config, m
     with pytest.raises(ConnectionError):
         manager.select_connection("broken")
 
-    # State is unchanged and self-consistent: all five pieces still describe `good`.
+    # Every piece of state still describes `good`, and they agree with each other: active_spec
+    # and active_config are derived from active_id, so a mismatch here means the swap tore.
     assert manager.active_id == "good"
     assert manager.active_spec.name == "sqlite"
     assert manager.active_config["name"] == "good"
     assert manager.engine is working_engine
-    assert manager.langchain_db is working_langchain_db
+    # The engine still points at the profile active_id names -- not at the rejected candidate.
+    assert str(manager.engine.url) == working_uri
+    assert str(manager.engine.url).endswith("good.db")
     # And it is genuinely still usable, not merely non-None.
     assert manager.execute_query("SELECT 1 AS one")["rows"] == [{"one": 1}]
+    assert "t" in manager.get_schema_metadata()["tables"]
     manager._dispose_engine()
 
 
@@ -550,12 +558,29 @@ def test_failed_switch_does_not_repersist_the_active_flag(tmp_path, isolated_con
 
 
 def test_test_connection_disposes_its_throwaway_engine(isolated_config, monkeypatch, tmp_path):
+    """`test_connection` must release the pool it opened, even though nothing else holds it.
+
+    Pool counters cannot prove this: a fresh, never-disposed pool also reports
+    ``checkedin() == 0``. So spy on the engine's own ``dispose`` and assert it was called,
+    then confirm the real dispose ran by checking SQLAlchemy swapped in a fresh pool object.
+    """
     manager = DatabaseManager()
     created = []
+    dispose_calls = []
     real_create_engine = db_module.create_engine
+
+    pools_at_creation = []
 
     def tracking_create_engine(*args, **kwargs):
         engine = real_create_engine(*args, **kwargs)
+        pools_at_creation.append(engine.pool)
+        real_dispose = engine.dispose
+
+        def spy_dispose(*a, **kw):
+            dispose_calls.append(engine)
+            return real_dispose(*a, **kw)
+
+        engine.dispose = spy_dispose
         created.append(engine)
         return engine
 
@@ -564,8 +589,11 @@ def test_test_connection_disposes_its_throwaway_engine(isolated_config, monkeypa
     ok, _ = manager.test_connection({"db_type": "sqlite", "path": str(tmp_path / "probe.db")})
     assert ok
     assert len(created) == 1
-    # A disposed pool reports zero checked-out/idle connections under a new pool instance.
-    assert created[0].pool.checkedin() == 0
+    throwaway = created[0]
+
+    assert dispose_calls == [throwaway], "the throwaway engine must be disposed exactly once"
+    # The real dispose() ran, not just the spy: SQLAlchemy recreates the pool object.
+    assert throwaway.pool is not pools_at_creation[0]
 
 
 def test_startup_selects_the_persisted_active_connection(tmp_path, isolated_config):
