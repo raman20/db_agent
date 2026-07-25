@@ -44,23 +44,69 @@ def reset_sample_warnings():
     _sample_warnings_emitted.clear()
 
 
-def _quote_identifier(spec, qualified: str) -> str:
-    """Quote a qualified table name part by part using the engine's quote character.
+def table_name_parts(spec, qualified: str, meta: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Recover the individual identifiers of a table from its metadata entry.
+
+    The catalog is *keyed* by a dotted display name, but a dotted display name is ambiguous:
+    a SQLite table literally called ``sales.2024`` and a Postgres table ``sales`` in schema
+    ``2024`` produce the same string. Splitting the key on dots therefore either quotes one
+    identifier as two (sampling then fails) or, worse, resolves to a different object. So the
+    parts come from the components ``get_schema_metadata()`` already records per table --
+    ``schema`` and ``table`` -- and only the leading catalog segment, which lives nowhere else,
+    is recovered from the key by removing the known ``schema.table`` suffix.
+
+    Two engine quirks are handled here rather than at the call site:
+
+    * DuckDB reports COMPOSITE schemas (``dtest.main``), which are one metadata field but two
+      SQL identifiers, so a composite schema is split on its last dot.
+    * Trino's catalog is not part of ``get_schema_names()`` output at all; it is prefixed onto
+      the display key by ``db._qualify``, which is why it is recovered from the key.
+    """
+    table = (meta or {}).get("table")
+    if not table:
+        # Metadata without split components (hand-built dicts, older callers). The display key
+        # is all we have, so fall back to its dotted reading -- documented, not preferred.
+        return [p for p in str(qualified).split(".") if p]
+
+    schema = (meta or {}).get("schema")
+    parts: List[str] = []
+
+    suffix = f"{schema}.{table}" if schema else table
+    if qualified.endswith(suffix) and len(qualified) > len(suffix):
+        catalog_part = qualified[: -len(suffix)].rstrip(".")
+        if catalog_part:
+            parts.append(catalog_part)
+
+    if schema:
+        if spec is not None and spec.schema_name_style == "composite":
+            database, _, leaf = schema.rpartition(".")
+            if database:
+                parts.append(database)
+            parts.append(leaf or schema)
+        else:
+            parts.append(schema)
+
+    parts.append(table)
+    return parts
+
+
+def quote_identifier(spec, parts: List[str]) -> str:
+    """Quote each identifier with the engine's quote character and join with dots.
 
     Never f-string a raw catalog name into SQL: a name containing a space, a keyword or a quote
-    character either breaks the statement or, worse, changes what it means. Each part is quoted
-    separately (the dots are separators, not part of any name) and an embedded quote character
+    character either breaks the statement or changes what it means. An embedded quote character
     is doubled, which is how every engine here escapes it.
     """
     quote = spec.quote_char if spec is not None else '"'
-    parts = [p for p in str(qualified).split(".") if p]
     return ".".join(f"{quote}{p.replace(quote, quote * 2)}{quote}" for p in parts)
 
 
-def build_sample_query(spec, qualified: str, limit: int = SAMPLE_ROW_LIMIT) -> str:
+def build_sample_query(spec, qualified: str, meta: Optional[Dict[str, Any]] = None,
+                       limit: int = SAMPLE_ROW_LIMIT) -> str:
     """``SELECT * FROM <safely quoted table> LIMIT n`` in the engine's limit syntax."""
     limit_clause = (spec.row_limit_clause if spec is not None else "LIMIT {n}").format(n=limit)
-    return f"SELECT * FROM {_quote_identifier(spec, qualified)} {limit_clause}"
+    identifier = quote_identifier(spec, table_name_parts(spec, qualified, meta))
+    return f"SELECT * FROM {identifier} {limit_clause}"
 
 
 def llm_target_label(llm_config: Optional[Dict[str, Any]] = None) -> str:
@@ -276,7 +322,8 @@ class SchemaPilotAgent:
 
     # ------------------------------------------------------------------ sampling
 
-    def collect_samples(self, db, spec, tables: List[str]) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    def collect_samples(self, db, spec, tables: List[str],
+                        catalog: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
         """Fetch up to :data:`SAMPLE_ROW_LIMIT` rows for each SHORTLISTED table.
 
         Sampling is opt-in (``include_samples: true`` on the connection profile) because the rows
@@ -290,8 +337,10 @@ class SchemaPilotAgent:
         """
         samples: Dict[str, Dict[str, Any]] = {}
         executed: List[str] = []
+        all_tables = (catalog or {}).get("tables", {}) or {}
         for qualified in tables:
-            sql = build_sample_query(spec, qualified, SAMPLE_ROW_LIMIT)
+            # The metadata entry, not the dotted key, is what makes the identifier unambiguous.
+            sql = build_sample_query(spec, qualified, all_tables.get(qualified), SAMPLE_ROW_LIMIT)
             executed.append(sql)
             try:
                 result = db.execute_query(sql)
@@ -308,8 +357,22 @@ class SchemaPilotAgent:
 
     async def execute(self, query: str, history: List[Dict[str, Any]] = None,
                       llm_config: Dict[str, Any] = None,
-                      pinned_tables: List[str] = None) -> AsyncGenerator[str, None]:
+                      pinned_tables: List[str] = None,
+                      catalog: Dict[str, Any] = None) -> AsyncGenerator[str, None]:
         """Runs the query lifecycle and streams newline-delimited JSON events.
+
+        Args:
+            query: the natural-language question.
+            history: prior turns, for context.
+            llm_config: per-call model overrides.
+            pinned_tables: qualified names the user pinned with ``@table``; always included.
+            catalog: already-materialised ``get_schema_metadata()`` output. Supply it and the
+                agent introspects NOTHING -- this is how the REPL hands over its warmed
+                ``SchemaCache`` so the completer, ``/schema``, ``@`` pin resolution and the LLM
+                prompt all describe the same catalog, and so a warehouse is introspected once per
+                ``/use`` rather than once per question. Omitted (the one-shot
+                ``schemapilot "question"`` path, and any direct library caller) the agent fetches
+                it itself, so this stays backward compatible.
 
         Events: ``agent_message``, ``schema_selection`` (what pruning chose, for ``/why``),
         ``final_output``, ``swarm_completed``, ``error``.
@@ -333,12 +396,15 @@ class SchemaPilotAgent:
 
         yield json.dumps({"event": "agent_message", "agent": "Architect", "message": "Reading schemas and generating optimized SQL query..."}) + "\n"
 
-        try:
-            # SchemaCache (repl/) is the sole owner of metadata caching; the agent just asks.
-            catalog = db.get_schema_metadata()
-        except Exception as e:
-            yield json.dumps({"event": "error", "error": f"Schema retrieval failed: {str(e)}"}) + "\n"
-            return
+        if catalog is None:
+            try:
+                # SchemaCache (repl/catalog.py) is the sole owner of metadata CACHING; the agent
+                # never caches. It only fetches when no caller handed it a catalog, which is the
+                # one-shot CLI path where there is no session to have warmed one.
+                catalog = db.get_schema_metadata()
+            except Exception as e:
+                yield json.dumps({"event": "error", "error": f"Schema retrieval failed: {str(e)}"}) + "\n"
+                return
 
         if not catalog.get("tables"):
             yield json.dumps({"event": "final_output", "text": "No tables detected. Verify your database connection."}) + "\n"
@@ -368,7 +434,7 @@ class SchemaPilotAgent:
                         f"{target}. Disable it in the connection profile to stop sending data."
                     ),
                 }) + "\n"
-            samples, _ = self.collect_samples(db, spec, selection["tables"])
+            samples, _ = self.collect_samples(db, spec, selection["tables"], catalog)
 
         schemas = render_schema(catalog, selection["tables"], samples)
 

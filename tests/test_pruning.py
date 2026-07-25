@@ -26,9 +26,18 @@ from schemapilot.pruning import select_relevant_tables
 # --------------------------------------------------------------------------- catalog fixtures
 
 
-def _table(name, columns, pk=None):
+def _table(name, columns, pk=None, schema=None, table=None):
+    """A metadata entry shaped exactly like ``get_schema_metadata()`` builds them.
+
+    Carrying ``schema``/``table`` separately matters: those components -- not the dotted display
+    key -- are what the sampling SQL is built from.
+    """
+    if table is None:
+        schema, _, table = name.rpartition(".")
     return {
         "name": name,
+        "schema": schema or None,
+        "table": table,
         "columns": [
             {"name": col, "type": "INTEGER" if col.endswith("_id") or col == "id" else "VARCHAR",
              "nullable": col != (pk or "id"), "is_primary": col == (pk or "id")}
@@ -212,15 +221,62 @@ def test_render_is_compact_and_carries_pk_and_fk(small_catalog):
 
 
 def test_sample_query_uses_quoted_qualified_identifiers():
-    assert build_sample_query(get_spec("postgres"), "public.orders") == (
+    pg = get_spec("postgres")
+    assert build_sample_query(pg, "public.orders", _table("public.orders", ["id"])) == (
         'SELECT * FROM "public"."orders" LIMIT 3'
     )
-    assert build_sample_query(get_spec("mysql"), "shop.orders") == (
+    assert build_sample_query(get_spec("mysql"), "shop.orders", _table("shop.orders", ["id"])) == (
         "SELECT * FROM `shop`.`orders` LIMIT 3"
     )
     # An embedded quote character is escaped, never interpolated raw.
-    assert build_sample_query(get_spec("postgres"), 'public.we"ird') == (
+    assert build_sample_query(pg, 'public.we"ird', _table('public.we"ird', ["id"])) == (
         'SELECT * FROM "public"."we""ird" LIMIT 3'
+    )
+
+
+def test_sample_query_handles_identifiers_containing_dots():
+    """A dot inside a name must not be read as a qualification separator.
+
+    The display key ``sales.2024`` is ambiguous on its own -- it can mean a SQLite table called
+    ``sales.2024`` or a Postgres table ``2024`` in schema ``sales``. The metadata components
+    disambiguate it, and the two cases must produce DIFFERENT SQL.
+    """
+    sqlite_meta = _table("sales.2024", ["id"], schema=None, table="sales.2024")
+    assert build_sample_query(get_spec("sqlite"), "sales.2024", sqlite_meta) == (
+        'SELECT * FROM "sales.2024" LIMIT 3'
+    )
+
+    pg_meta = _table("sales.2024", ["id"], schema="sales", table="2024")
+    assert build_sample_query(get_spec("postgres"), "sales.2024", pg_meta) == (
+        'SELECT * FROM "sales"."2024" LIMIT 3'
+    )
+
+    # A dotted TABLE name inside a schema stays one identifier.
+    dotted_in_schema = _table("public.sales.2024", ["id"], schema="public", table="sales.2024")
+    assert build_sample_query(get_spec("postgres"), "public.sales.2024", dotted_in_schema) == (
+        'SELECT * FROM "public"."sales.2024" LIMIT 3'
+    )
+
+
+def test_sample_query_keeps_the_trino_catalog_and_the_duckdb_composite_schema():
+    # Trino's catalog is prefixed onto the display key by db._qualify and lives in no field, so
+    # it is recovered from the key by stripping the known schema.table suffix.
+    trino_meta = _table("tpch.tiny.orders", ["id"], schema="tiny", table="orders")
+    assert build_sample_query(get_spec("trino"), "tpch.tiny.orders", trino_meta) == (
+        'SELECT * FROM "tpch"."tiny"."orders" LIMIT 3'
+    )
+
+    # DuckDB reports a COMPOSITE schema (`db.schema`): one metadata field, two SQL identifiers.
+    duck_meta = _table("dtest.other.orders", ["id"], schema="dtest.other", table="orders")
+    assert build_sample_query(get_spec("duckdb"), "dtest.other.orders", duck_meta) == (
+        'SELECT * FROM "dtest"."other"."orders" LIMIT 3'
+    )
+
+
+def test_sample_query_falls_back_to_the_key_without_components():
+    """Metadata lacking split components (hand-built dicts) still yields runnable SQL."""
+    assert build_sample_query(get_spec("postgres"), "public.orders", {"columns": []}) == (
+        'SELECT * FROM "public"."orders" LIMIT 3'
     )
 
 
@@ -265,6 +321,9 @@ class FakeDB:
         self._config = config or {}
         self.executed = []
         self.rows = rows if rows is not None else [{"n": 1}]
+        #: How many times introspection was actually performed -- the cost the warmed
+        #: SchemaCache exists to avoid paying per question.
+        self.introspections = 0
 
     @property
     def active_spec(self):
@@ -275,6 +334,7 @@ class FakeDB:
         return self._config
 
     def get_schema_metadata(self, schemas=None, max_tables=None):
+        self.introspections += 1
         return self.catalog
 
     def execute_query(self, sql):
@@ -282,7 +342,8 @@ class FakeDB:
         return {"columns": list(self.rows[0].keys()) if self.rows else [], "rows": list(self.rows)}
 
 
-def run_agent(monkeypatch, db, llm, query="how many orders per customer?", pinned=None):
+def run_agent(monkeypatch, db, llm, query="how many orders per customer?", pinned=None,
+              catalog=None):
     """Drive agent.execute end to end against the stubs and return the parsed events."""
     monkeypatch.setattr(agent_module, "get_db", lambda: db)
     monkeypatch.setattr(agent_module, "get_llm", lambda config=None: llm)
@@ -291,7 +352,8 @@ def run_agent(monkeypatch, db, llm, query="how many orders per customer?", pinne
 
     async def drive():
         events = []
-        async for chunk in SchemaPilotAgent().execute(query, pinned_tables=pinned):
+        agent = SchemaPilotAgent()
+        async for chunk in agent.execute(query, pinned_tables=pinned, catalog=catalog):
             if chunk.strip():
                 events.append(json.loads(chunk))
         return events
@@ -370,6 +432,56 @@ def test_only_selected_tables_reach_the_prompt(monkeypatch, wide_catalog):
             assert f"TABLE {table}" not in prompt
 
 
+# --------------------------------------------------------------------------- catalog ownership
+
+
+def test_supplied_catalog_means_the_agent_does_not_introspect(monkeypatch, wide_catalog):
+    """A question after a warm must not re-run introspection.
+
+    This is the single-owner contract in practice: the REPL warms ``SchemaCache`` on ``/use`` and
+    hands the result over, so completion, ``/schema``, pin resolution and the LLM prompt all see
+    the same catalog and a slow warehouse is introspected once per connection, not once per
+    question.
+    """
+    db = FakeDB(wide_catalog)
+    llm = StubLLM()
+    events = run_agent(monkeypatch, db, llm, catalog=wide_catalog)
+
+    assert db.introspections == 0
+    # ...and the supplied catalog is genuinely what was used.
+    selected = next(e for e in events if e["event"] == "schema_selection")["tables"]
+    assert "public.orders" in selected
+
+
+def test_agent_still_introspects_when_no_catalog_is_supplied(monkeypatch, wide_catalog):
+    """The one-shot ``schemapilot "question"`` path has no session, so it must self-serve."""
+    db = FakeDB(wide_catalog)
+    run_agent(monkeypatch, db, StubLLM())
+    assert db.introspections == 1
+
+
+def test_supplied_catalog_wins_over_the_databases_own(monkeypatch, wide_catalog, small_catalog):
+    """Proves the injected catalog is used rather than merely accepted and ignored."""
+    db = FakeDB(wide_catalog)
+    llm = StubLLM()
+    events = run_agent(monkeypatch, db, llm, query="list the widgets", catalog=small_catalog)
+
+    selected = next(e for e in events if e["event"] == "schema_selection")["tables"]
+    assert sorted(selected) == sorted(small_catalog["tables"])
+    assert db.introspections == 0
+
+
+def test_supplied_empty_catalog_reports_no_tables(monkeypatch, wide_catalog):
+    """An empty warmed catalog must not silently fall back to introspecting."""
+    db = FakeDB(wide_catalog)
+    events = run_agent(monkeypatch, db, StubLLM(),
+                       catalog={"tables": {}, "relationships": [], "truncated": False,
+                                "total_tables": 0})
+
+    assert db.introspections == 0
+    assert any(e["event"] == "final_output" and "No tables detected" in e["text"] for e in events)
+
+
 # --------------------------------------------------------------------------- sampling
 
 
@@ -385,7 +497,8 @@ def test_samples_only_when_opted_in_and_only_for_shortlisted_tables(monkeypatch,
     assert sample_sql, db.executed
     assert len(sample_sql) == len(selected)
 
-    expected = {build_sample_query(get_spec("postgres"), t) for t in selected}
+    expected = {build_sample_query(get_spec("postgres"), t, wide_catalog["tables"][t])
+                for t in selected}
     assert set(sample_sql) == expected
     for statement in sample_sql:
         assert statement.endswith(f"LIMIT {SAMPLE_ROW_LIMIT}")
@@ -399,6 +512,23 @@ def test_samples_only_when_opted_in_and_only_for_shortlisted_tables(monkeypatch,
     warning = next(e for e in events if e["event"] == "agent_message"
                    and "include_samples" in e.get("message", ""))
     assert "stub-provider" in warning["message"]
+
+
+def test_sampling_uses_metadata_components_not_the_dotted_key(monkeypatch):
+    """End to end: a SQLite table whose NAME contains a dot is sampled as one identifier."""
+    tables = {
+        "sales.2024": _table("sales.2024", ["id", "amount"], schema=None, table="sales.2024"),
+        "customers": _table("customers", ["id", "name"], schema=None, table="customers"),
+    }
+    catalog = {"tables": tables, "relationships": [], "truncated": False, "total_tables": 2}
+    db = FakeDB(catalog, engine="sqlite", config={"include_samples": True},
+                rows=[{"id": 1, "amount": 5}])
+
+    run_agent(monkeypatch, db, StubLLM(), query="total sales in 2024", catalog=catalog)
+
+    assert 'SELECT * FROM "sales.2024" LIMIT 3' in db.executed
+    # The wrong reading -- two identifiers -- must never be emitted.
+    assert 'SELECT * FROM "sales"."2024" LIMIT 3' not in db.executed
 
 
 def test_sample_warning_is_emitted_once_per_connection(monkeypatch, wide_catalog):
