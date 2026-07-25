@@ -28,7 +28,7 @@ schema-pilot/
 │   └── agent.py           # SQL generation and evaluation pipeline
 ├── tests/                 # Unit tests
 │   └── test_security.py   # Security AST test suite
-├── cli.py                 # CLI entrypoint driver
+│   └── cli.py             # CLI entrypoint driver (schemapilot.cli:main)
 ├── pyproject.toml         # Python packaging metadata (PEP 517/621)
 ├── requirements.txt       # Project dependencies
 ├── Makefile               # Task runner definitions

@@ -6,13 +6,9 @@ import asyncio
 import argparse
 import uuid
 
-# Add the project root to sys.path to enable importing the 'schemapilot' package
-project_root = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(project_root)
-
-# Load env variables
-from dotenv import load_dotenv
-load_dotenv(os.path.join(project_root, ".env"))
+# Env loading is owned by schemapilot.config, which resolves the .env file the same way
+# no matter which directory the installed `schemapilot` command is invoked from.
+from schemapilot.config import settings
 
 from schemapilot.db import get_db
 from schemapilot.agent import SchemaPilotAgent
@@ -393,10 +389,13 @@ def main():
         if not llm_config:
             print("\033[91m❌ Error: Specify at least one LLM parameter (--provider, --model, --api-key, or --base-url) to save.\033[0m", file=sys.stderr)
             return
-        from schemapilot.llm import save_llm_config, load_saved_llm_config
-        existing = load_saved_llm_config()
+        manager = get_model_manager()
+        profile_id = "default"
+        existing = dict(manager.profiles.get(profile_id, {}))
+        existing.pop("is_active", None)
         merged = {**existing, **llm_config}
-        save_llm_config(merged)
+        manager.add_profile(profile_id, merged)
+        manager.select_profile(profile_id)
         print("\033[92m✅ Saved LLM settings successfully as default configuration profile!\033[0m")
         return
 

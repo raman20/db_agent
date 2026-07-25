@@ -1,12 +1,15 @@
 import os
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 # Calculate project root of the installed package
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Load environment variables globally from package root .env
+# Load environment variables. The package-root .env supports editable/source checkouts;
+# find_dotenv walks up from the current working directory so an installed `schemapilot`
+# invoked from a project folder still picks that project's .env up.
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+load_dotenv(find_dotenv(usecwd=True), override=False)
 
 class Settings(BaseModel):
     # Active Database Configuration
