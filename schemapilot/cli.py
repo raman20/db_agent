@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 import sys
 import json
 import asyncio
@@ -14,6 +13,7 @@ from schemapilot.db import get_db
 from schemapilot.agent import SchemaPilotAgent
 from schemapilot.engines import engine_names, get_spec
 from schemapilot.llm import get_model_manager
+from schemapilot.repl import ReplSession
 
 # Prompt text per connection field; the set of fields asked for comes from the engine spec.
 FIELD_PROMPTS = {
@@ -35,12 +35,9 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
-from rich.text import Text
 
-# SOTA Prompt toolkit imports
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.formatted_text import HTML
+# prompt_toolkit is used by schemapilot.repl, which owns the interactive loop.
+
 
 class SchemaPilotCLI:
     def __init__(self, llm_config=None):
@@ -49,12 +46,8 @@ class SchemaPilotCLI:
         self.db = get_db()
         self.model_manager = get_model_manager()
         self.console = Console()
-        
-        # Setup REPL history session in user's home configuration directory
-        USER_CONFIG_DIR = os.path.expanduser("~/.config/schemapilot")
-        history_file = os.path.join(USER_CONFIG_DIR, ".repl_history")
-        os.makedirs(os.path.dirname(history_file), exist_ok=True)
-        self.session = PromptSession(history=FileHistory(history_file))
+        # The interactive shell (prompt session, history, completion, commands) lives in
+        # schemapilot.repl; this class keeps the argparse-driven, non-interactive surface.
 
     def format_agent_name(self, agent):
         colors = {
@@ -155,46 +148,23 @@ class SchemaPilotCLI:
         except Exception as e:
             self.console.print(f"[bold red]❌ Local Query Execution Error: {e}[/bold red]")
 
+    def build_repl_session(self) -> ReplSession:
+        """Builds the REPL session, wiring this class's Rich renderer into it.
+
+        The renderer is injected rather than duplicated so `schemapilot "question"` and the
+        interactive shell print results identically.
+        """
+        return ReplSession(
+            db=self.db,
+            console=self.console,
+            model_manager=self.model_manager,
+            llm_config=self.llm_config,
+            event_renderer=self.handle_event,
+        )
+
     def interactive_shell(self):
-        # Fetch active connection details
-        active_db = "None"
-        for conn in self.db.get_connections_list():
-            if conn["is_active"]:
-                active_db = f"{conn['name']} ({conn['db_type'].upper()})"
-                
-        # Fetch active model profile details
-        active_model = "Default (.env)"
-        active_profile = self.model_manager.get_active_profile()
-        if self.model_manager.active_id:
-            active_model = f"{self.model_manager.active_id} ({active_profile.get('model_name')})"
-                
-        self.console.print(Panel(
-            Text.assemble(
-                ("SchemaPilot Console CLI (Local Only)\n", "bold blue"),
-                ("Database Connection: ", "bold"), (f"{active_db}\n", "green"),
-                ("AI Model Profile:   ", "bold"), (f"{active_model}", "green")
-            ),
-            border_style="blue",
-            expand=False
-        ))
-        
-        self.console.print("Type your database query. Press [bold]Up/Down[/bold] for history. Type '[bold]exit[/bold]' to quit.")
-        
-        while True:
-            try:
-                # SOTA Prompt prompt_toolkit session
-                query = self.session.prompt(HTML("<cyan><b>🤔 Ask SchemaPilot &gt; </b></cyan>")).strip()
-                if not query:
-                    continue
-                if query.lower() in ["exit", "quit"]:
-                    self.console.print("\nGoodbye! 👋")
-                    break
-                asyncio.run(self.execute_query(query))
-            except KeyboardInterrupt:
-                self.console.print("\nGoodbye! 👋")
-                break
-            except Exception as e:
-                self.console.print(f"[bold red]❌ Error: {e}[/bold red]")
+        """Launches the REPL (schemapilot.repl owns the loop, commands and completion)."""
+        self.build_repl_session().run()
 
     # ----------------------------------------------------
     # Database Connection Profile Management
