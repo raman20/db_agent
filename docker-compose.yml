@@ -1,3 +1,11 @@
+# SchemaPilot local engine sandbox.
+#
+#   docker compose up -d --wait     # blocks until every healthcheck passes
+#   SCHEMAPILOT_IT=1 make test-integration
+#
+# Trino is the slow one: a cold start takes 30-60s before the coordinator accepts queries,
+# which is why it has a healthcheck with a generous start_period AND the test fixture retries.
+# Images are pinned so the integration matrix tests the same servers on every machine.
 services:
   schemapilot-mysql:
     image: mysql:8.0
@@ -12,6 +20,14 @@ services:
       - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+      # *.sql here runs once, only when the data directory is empty.
+      - ./tests/fixtures/mysql-init.sql:/docker-entrypoint-initdb.d/01-schemapilot.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_password_abc_123"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
   schemapilot-postgres:
     image: postgres:15
@@ -25,7 +41,57 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./tests/fixtures/postgres-init.sql:/docker-entrypoint-initdb.d/01-schemapilot.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U schemapilot_user -d schemapilot_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  schemapilot-trino:
+    # Pinned: Trino ships breaking SQL/protocol changes between releases.
+    image: trinodb/trino:468
+    container_name: schemapilot-trino
+    restart: always
+    ports:
+      - "8080:8080"
+    # No seeding at all: the built-in `tpch` catalog already provides real
+    # catalog.schema.table (3-part) names, e.g. tpch.tiny.customer.
+    healthcheck:
+      test: ["CMD-SHELL", "trino --server http://localhost:8080 --execute 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
+      retries: 30
+      start_period: 60s
+
+  schemapilot-clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: schemapilot-clickhouse
+    restart: always
+    environment:
+      CLICKHOUSE_DB: schemapilot_db
+      CLICKHOUSE_USER: schemapilot_user
+      CLICKHOUSE_PASSWORD: schemapilot_password_xyz
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"   # HTTP interface -- what clickhouse-connect speaks
+      - "9000:9000"   # native protocol, handy for the clickhouse-client CLI
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./tests/fixtures/clickhouse-init.sql:/docker-entrypoint-initdb.d/01-schemapilot.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
 
 volumes:
   mysql_data:
   postgres_data:
+  clickhouse_data:
