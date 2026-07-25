@@ -5,6 +5,7 @@ construction.
 """
 
 import json
+import logging
 import os
 import stat
 
@@ -132,6 +133,73 @@ def test_per_table_error_is_skipped_not_fatal(sqlite_db, monkeypatch):
     meta = sqlite_db.get_schema_metadata()
     assert set(meta["tables"]) == {"parent"}
     assert meta["total_tables"] == 2
+    # Partial attrition is reported but is not a wholesale failure.
+    assert meta["skipped_tables"] == ["child"]
+    assert meta["reflection_failed"] is False
+
+
+def test_total_reflection_failure_is_loud_not_an_empty_catalog(sqlite_db, monkeypatch, caplog):
+    """Losing EVERY table is a defect, not tolerable attrition, and must be visible.
+
+    This is the failure mode that hid the ClickHouse inspect(engine) bug: each table was caught
+    by the tolerant per-table handler, so the caller saw a clean-looking empty catalog with a
+    correct total_tables and no complaint.
+    """
+    from sqlalchemy.engine.reflection import Inspector
+
+    monkeypatch.setattr(
+        Inspector, "get_columns",
+        lambda self, table_name, schema=None, **kw: (_ for _ in ()).throw(RuntimeError("no execute")),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="schemapilot.db"):
+        meta = sqlite_db.get_schema_metadata()
+
+    assert meta["tables"] == {}
+    assert meta["total_tables"] == 2
+    assert meta["reflection_failed"] is True
+    assert sorted(meta["skipped_tables"]) == ["child", "parent"]
+    assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_empty_database_is_not_reported_as_a_reflection_failure(tmp_path, isolated_config):
+    """An genuinely empty schema must stay distinguishable from a failed reflection."""
+    path = tmp_path / "empty.db"
+    engine = create_engine(f"sqlite:///{path}")
+    engine.connect().close()
+    engine.dispose()
+
+    manager = DatabaseManager()
+    manager.add_connection("empty", {"name": "empty", "db_type": "sqlite", "path": str(path)})
+    manager.select_connection("empty")
+
+    meta = manager.get_schema_metadata()
+    assert meta["tables"] == {}
+    assert meta["total_tables"] == 0
+    assert meta["reflection_failed"] is False
+    manager._dispose_engine()
+
+
+def test_inspector_is_bound_to_a_connection_not_the_engine(sqlite_db):
+    """Regression: clickhouse-connect's inspector calls the 1.x `bind.execute()`.
+
+    A Connection has it, an Engine does not in SQLAlchemy 2.x, so binding to the Engine made
+    every ClickHouse table fail reflection and returned an empty catalog.
+    """
+    from sqlalchemy.engine import Connection
+
+    seen = []
+    original_inspect = db_module.inspect
+
+    def recording_inspect(target):
+        seen.append(target)
+        return original_inspect(target)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(db_module, "inspect", recording_inspect)
+        sqlite_db.get_schema_metadata()
+
+    assert seen and all(isinstance(target, Connection) for target in seen)
 
 
 def test_duckdb_qualified_keys_and_composite_schema_parsing(duckdb_db):

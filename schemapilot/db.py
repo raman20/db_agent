@@ -378,7 +378,8 @@ class DatabaseManager:
         """Extracts schema definitions for the active connection.
 
         Returns ``{"tables": {qualified_name: {...}}, "relationships": [...],
-        "truncated": bool, "total_tables": int}``.
+        "truncated": bool, "total_tables": int, "skipped_tables": [...],
+        "reflection_failed": bool}``.
         """
         if not self.engine:
             raise ConnectionError("No active database connection selected")
@@ -387,7 +388,18 @@ class DatabaseManager:
         config = self.active_config
         cap = max_tables if max_tables is not None else settings.CATALOG_MAX_TABLES
 
-        inspector = inspect(self.engine)
+        # Bind the inspector to a checked-out Connection, NOT to the Engine. Verified against a
+        # live ClickHouse: clickhouse-connect's inspector still calls the SQLAlchemy 1.x
+        # `bind.execute()`, which a Connection has and an Engine does not in 2.x, so
+        # inspect(engine).get_columns(...) raised AttributeError for every table and the whole
+        # catalog came back empty. A Connection satisfies both the 1.x-style and 2.x dialects.
+        with self.engine.connect() as conn:
+            return self._reflect(conn, spec, config, schemas, cap)
+
+    def _reflect(self, conn, spec: EngineSpec, config: Dict[str, Any],
+                 schemas: Optional[List[str]], cap: int) -> Dict[str, Any]:
+        """Reflects the catalog over an already-open connection."""
+        inspector = inspect(conn)
         target_schemas = self._resolve_schemas(inspector, spec, config, schemas)
 
         # Collect the full (schema, table) inventory first so `total_tables` reports what exists
@@ -405,8 +417,10 @@ class DatabaseManager:
 
         tables_metadata: Dict[str, Any] = {}
         relationships: List[Dict[str, Any]] = []
+        skipped: List[str] = []
 
-        for schema, table in inventory[:cap]:
+        attempted = inventory[:cap]
+        for schema, table in attempted:
             qualified = self._qualify(spec, config, schema, table)
             try:
                 # get_pk_constraint(), NOT get_primary_keys(): the latter was removed before
@@ -444,13 +458,35 @@ class DatabaseManager:
                 # One unreadable table (permissions, an exotic type, a view over a dead source)
                 # must not cost the user the entire catalog.
                 logger.warning(f"Skipping table '{qualified}': {e}")
+                skipped.append(qualified)
                 continue
+
+        # A wholesale reflection failure looks identical to an empty database unless we say so.
+        # That is exactly how the ClickHouse inspect(engine) bug hid: every table hit the
+        # tolerant per-table handler above, so the caller got a clean-looking empty catalog with
+        # a correct total_tables and no complaint. Losing EVERY table is a defect, not tolerable
+        # attrition, so it is logged at error level and flagged in the result.
+        reflection_failed = bool(attempted) and not tables_metadata
+        if reflection_failed:
+            logger.error(
+                f"Reflection failed for all {len(attempted)} table(s) on engine "
+                f"'{spec.name}' -- returning an empty catalog. First failure above; "
+                f"tables: {', '.join(skipped[:5])}"
+                + (" ..." if len(skipped) > 5 else "")
+            )
+        elif skipped:
+            logger.warning(
+                f"Reflected {len(tables_metadata)} of {len(attempted)} table(s); "
+                f"skipped: {', '.join(skipped)}"
+            )
 
         return {
             "tables": tables_metadata,
             "relationships": relationships,
             "truncated": truncated,
             "total_tables": total_tables,
+            "skipped_tables": skipped,
+            "reflection_failed": reflection_failed,
         }
 
 # Singleton instance
