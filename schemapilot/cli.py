@@ -409,12 +409,8 @@ def main():
     elif args.query:
         asyncio.run(cli.execute_query(args.query))
     else:
-        # If no flags are passed, launch REPL
-        has_action = any([args.add_conn, args.list_conns, args.select_conn, args.delete_conn,
-                          args.add_model, args.list_models, args.select_model, args.delete_model,
-                          args.save_llm])
-        if not has_action:
-            cli.interactive_shell()
+        # Every flag is handled by a branch above, so reaching here means none was passed.
+        cli.interactive_shell()
 
 if __name__ == "__main__":
     main()

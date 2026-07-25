@@ -60,7 +60,6 @@ SQLITE = EngineSpec(
     sql_name_parts=1,
     connection_fields=("path",),
     quote_char='"',
-    has_information_schema=False,
     readonly_commands=frozenset(),
     # SQLite's pragma namespace mixes introspection with persistent, destructive settings
     # (`user_version`, `journal_mode`, `writable_schema`), and sqlglot parses the read form

@@ -68,7 +68,6 @@ class EngineSpec:
     #: is a statement about SchemaPilot's guarantee, not about the engine's platform.
     supports_safe_dry_run: bool = True
 
-    has_information_schema: bool = True
     row_limit_clause: str = "LIMIT {n}"
 
     #: Leading keywords of unparsed statements (``exp.Command``) that are read-only on this

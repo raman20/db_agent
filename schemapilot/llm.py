@@ -144,7 +144,8 @@ def get_llm(config_override: Dict[str, Any] = None):
     model_name = str(config.get("model_name", "gemini-2.0-flash"))
     api_key = config.get("api_key", "")
     base_url = config.get("base_url", "")
-    temp = 0.0
+    from schemapilot.config import settings
+    temp = settings.TEMPERATURE
 
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI

@@ -25,7 +25,8 @@ class Settings(BaseModel):
     LLM_MODEL_NAME: str = Field(default_factory=lambda: os.getenv("LLM_MODEL_NAME", "gemini-2.0-flash"))
     LLM_API_KEY: str = Field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
     LLM_BASE_URL: str = Field(default_factory=lambda: os.getenv("LLM_BASE_URL", ""))
-    TEMPERATURE: float = 0.0
+    # Deterministic by default: SQL generation is not a place for sampling variance.
+    TEMPERATURE: float = Field(default_factory=lambda: float(os.getenv("LLM_TEMPERATURE", "0.0")))
     
     # Catalog / Prompt Budgets
     # CATALOG_MAX_TABLES caps how many tables introspection reflects (wide warehouses can hold
@@ -38,10 +39,5 @@ class Settings(BaseModel):
     
     # Security Settings
     ALLOW_MUTATING_QUERIES: bool = Field(default_factory=lambda: os.getenv("ALLOW_MUTATING_QUERIES", "false").lower() == "true")
-    MAX_QUERY_LIMIT: int = 1000
-    
-    # Semantic Caching
-    CACHE_ENABLED: bool = Field(default_factory=lambda: os.getenv("CACHE_ENABLED", "true").lower() == "true")
-    CACHE_SIMILARITY_THRESHOLD: float = 0.92
 
 settings = Settings()

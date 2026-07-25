@@ -42,7 +42,6 @@ DUCKDB = EngineSpec(
     # connection_fields is declared rather than derived from sql_name_parts.
     connection_fields=("path",),
     quote_char='"',
-    has_information_schema=True,
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC"}),
     # DuckDB pragmas are also a mixed namespace (`PRAGMA enable_external_access`, `PRAGMA
     # temp_directory='...'` are settings, not queries), so only the bare introspection ones.
