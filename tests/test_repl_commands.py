@@ -291,6 +291,44 @@ def test_sql_refuses_drop(session):
     assert "Security Violation" in output(session)
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "PRAGMA user_version = 4242",
+        "PRAGMA writable_schema = ON",
+        "PRAGMA journal_mode = WAL",
+    ],
+)
+def test_sql_refuses_writable_pragmas(session, statement):
+    """Regression at the REPL surface: a writable PRAGMA persists on file-backed SQLite.
+
+    A class-wide ``exp.Pragma`` allowance used to let these through, so `/sql` -- a read-only
+    surface -- could permanently rewrite the database header. Asserted here as well as in the
+    sentry's own suite because `/sql` is the surface that has to stay refused: it is the one path
+    where the user's raw text reaches the engine with no LLM in between.
+    """
+    handle_line(session, f"/sql {statement}")
+    text_out = output(session)
+    assert "Security Violation" in text_out
+    assert "read-only" in text_out
+
+
+def test_writable_pragma_does_not_reach_the_database(session, monkeypatch):
+    """The refusal happens BEFORE execution, not as a post-hoc complaint."""
+    def explode(*args, **kwargs):
+        raise AssertionError("a refused statement must never be executed")
+
+    monkeypatch.setattr(session.db, "execute_query", explode)
+    handle_line(session, "/sql PRAGMA user_version = 4242")
+    assert "Security Violation" in output(session)
+
+
+def test_sql_still_allows_a_bare_readonly_pragma(session):
+    """The fix is by-name gating, not a blanket PRAGMA ban: introspection pragmas still work."""
+    handle_line(session, "/sql PRAGMA database_list")
+    assert "Security Violation" not in output(session)
+
+
 def test_sql_uses_the_spec_dialect_not_the_sqlalchemy_dialect_name(session, monkeypatch):
     """`db.engine.dialect.name` reports names our registry does not use (clickhousedb,
     postgresql), so the sentry must be handed `spec.sqlglot_dialect` and `spec.name`."""
@@ -490,24 +528,36 @@ def test_tracebacks_go_to_the_log_file_not_the_prompt(session, tmp_path):
         assert "RuntimeError: boom" in handle.read()
 
 
-def _install_fake_agent(monkeypatch, events, record):
+def _install_fake_agent(monkeypatch, events, record, legacy_signature=False):
     """Substitutes schemapilot.agent with a stub module.
 
     Injected through sys.modules rather than monkeypatching the class so the test never imports
     langchain and never makes an LLM call.
+
+    ``legacy_signature=True`` drops ``pinned_tables``/``catalog`` from ``execute``, standing in
+    for an agent build that predates them -- the session feature-checks the signature rather than
+    assuming, and that path needs covering too.
     """
     import sys
     import types
 
     class FakeAgent:
-        async def execute(self, question, history=None, llm_config=None, pinned_tables=None):
+        async def execute(self, question, history=None, llm_config=None,
+                          pinned_tables=None, catalog=None):
             record["question"] = question
             record["pinned_tables"] = pinned_tables
+            record["catalog"] = catalog
+            for event in events:
+                yield event
+
+    class LegacyAgent:
+        async def execute(self, question, history=None, llm_config=None):
+            record["question"] = question
             for event in events:
                 yield event
 
     module = types.ModuleType("schemapilot.agent")
-    module.SchemaPilotAgent = FakeAgent
+    module.SchemaPilotAgent = LegacyAgent if legacy_signature else FakeAgent
     monkeypatch.setitem(sys.modules, "schemapilot.agent", module)
 
 
@@ -543,6 +593,121 @@ def test_missing_schema_selection_event_degrades_gracefully(session, monkeypatch
 
     handle_line(session, "/why")
     assert "No table-selection decision recorded" in output(session)
+
+
+# ------------------------------------------------------- the warmed catalog reaches the agent
+
+
+def test_question_after_use_does_not_introspect_again(session, second_connection, monkeypatch):
+    """/use warms the catalog once; the question must reuse it, not re-introspect.
+
+    This is the "SchemaCache is the sole owner of metadata" contract in its most expensive form:
+    re-fetching per question duplicates slow warehouse introspection and lets the LLM prompt
+    describe a different catalog than completion and /schema do.
+    """
+    record = {}
+    _install_fake_agent(monkeypatch, ['{"event": "final_output", "text": "ok"}\n'], record)
+
+    handle_line(session, "/use warehouse")
+    assert session.catalog.is_warm
+
+    # Anything reaching the database after the warm is a duplicate fetch, so make it fatal.
+    def explode(*args, **kwargs):
+        raise AssertionError("the question must not re-introspect after /use warmed the catalog")
+
+    monkeypatch.setattr(session.db, "get_schema_metadata", explode)
+    session.ask("how many events?")
+
+    # Handed over verbatim as the raw get_schema_metadata() dict, not a SchemaCache wrapper.
+    assert isinstance(record["catalog"], dict)
+    assert set(record["catalog"]) >= {"tables", "relationships", "truncated", "total_tables"}
+    assert any(name.endswith("events") for name in record["catalog"]["tables"])
+
+
+def test_question_warms_the_catalog_exactly_once_across_several_questions(session, monkeypatch):
+    """A cold session fetches on the first question and never again."""
+    record = {}
+    _install_fake_agent(monkeypatch, ['{"event": "final_output", "text": "ok"}\n'], record)
+
+    real = session.db.get_schema_metadata
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(session.db, "get_schema_metadata", counting)
+    session.catalog.invalidate()
+
+    session.ask("first question")
+    session.ask("second question")
+    session.ask("third question")
+
+    assert len(calls) == 1
+    assert record["catalog"]["tables"]
+
+
+def test_agent_gets_the_same_catalog_object_the_completer_sees(session, monkeypatch):
+    """One catalog, one owner: the tables in the prompt are the tables that complete."""
+    record = {}
+    _install_fake_agent(monkeypatch, ['{"event": "final_output", "text": "ok"}\n'], record)
+
+    session.catalog.warm()
+    session.ask("who spends the most?")
+
+    assert sorted(record["catalog"]["tables"]) == session.catalog.table_names()
+
+
+def test_catalog_is_not_passed_to_an_agent_that_cannot_accept_it(session, monkeypatch):
+    """Feature-checked, not assumed: an older agent build must not get a TypeError."""
+    record = {}
+    _install_fake_agent(
+        monkeypatch,
+        ['{"event": "final_output", "text": "ok"}\n'],
+        record,
+        legacy_signature=True,
+    )
+
+    session.catalog.warm()
+    session.pin_table("orders")
+    session.ask("who spends the most?")
+
+    assert record["question"] == "who spends the most?"
+    assert "catalog" not in record
+    assert "No table-selection decision recorded" not in output(session)
+
+
+def test_a_failed_warm_omits_the_catalog_rather_than_sending_an_empty_one(session, monkeypatch):
+    """A supplied catalog is trusted absolutely, so a broken warm must NOT hand over {}.
+
+    The agent reports "No tables detected" for an empty supplied catalog, which would turn a
+    transient read failure into a confident wrong answer. Omitting the kwarg lets the agent's own
+    introspection surface the real error instead.
+    """
+    record = {}
+    _install_fake_agent(monkeypatch, ['{"event": "final_output", "text": "ok"}\n'], record)
+
+    session.catalog.invalidate()
+    monkeypatch.setattr(
+        session.db,
+        "get_schema_metadata",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reflection exploded")),
+    )
+
+    session.ask("how many orders?")
+
+    assert record["catalog"] is None
+
+
+def test_one_shot_cli_path_passes_no_catalog(session):
+    """`schemapilot "question"` runs through cli.execute_query, which has no warmed session --
+    that path must keep working by letting the agent fetch the catalog itself."""
+    import inspect as _inspect
+
+    from schemapilot.cli import SchemaPilotCLI
+
+    source = _inspect.getsource(SchemaPilotCLI.execute_query)
+    assert "catalog=" not in source
 
 
 def test_status_line_advertises_read_only(session):

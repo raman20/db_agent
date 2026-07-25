@@ -273,11 +273,10 @@ class ReplSession:
         agent = SchemaPilotAgent()
         self.history.append({"role": "user", "content": question})
 
-        kwargs = {}
-        if pinned and self._accepts_pinned(agent):
-            kwargs["pinned_tables"] = pinned
-
         with self.console.status("[bold blue]Resolving database schema...") as status:
+            # Inside the status block because building the kwargs can include warming the
+            # catalog, which is the slow part on a warehouse and should show the spinner.
+            kwargs = self._agent_kwargs(agent, pinned)
             async for chunk in agent.execute(question, self.history[:-1], self.llm_config, **kwargs):
                 if not chunk.strip():
                     continue
@@ -299,15 +298,48 @@ class ReplSession:
                 else:
                     self.event_renderer(event)
 
-    @staticmethod
-    def _accepts_pinned(agent) -> bool:
-        """Whether this agent build takes ``pinned_tables=``.
+    def _agent_kwargs(self, agent, pinned: List[str]) -> Dict[str, Any]:
+        """Builds the optional keyword arguments for ``agent.execute``.
 
-        Checked rather than assumed so the REPL works against both the pre-pruning agent and the
-        pruning-aware one, instead of dying with a TypeError on the first pinned question.
+        ``catalog=`` is the important one: the session hands the agent its ALREADY WARMED
+        metadata, so the agent introspects nothing. Without it the agent re-ran
+        ``get_schema_metadata()`` on every single question -- duplicating slow warehouse
+        introspection that ``/use`` had just done, and, worse, letting completion, ``/schema``,
+        ``@`` pin resolution and the LLM prompt each observe a different catalog. ``SchemaCache``
+        is the sole owner of this metadata, so it is the only thing that should ever fetch it.
+
+        The value handed over is the raw ``get_schema_metadata()`` dict verbatim
+        (``{"tables": ..., "relationships": ..., "truncated": ..., "total_tables": ...}``), not a
+        ``SchemaCache``: the agent must stay usable by callers that have no session.
+        """
+        kwargs: Dict[str, Any] = {}
+
+        if pinned and self._accepts(agent, "pinned_tables"):
+            kwargs["pinned_tables"] = pinned
+
+        if self._accepts(agent, "catalog"):
+            try:
+                # warm() is a no-op when /use already warmed it; on the first question of a
+                # cold session it does the one fetch this session will ever need.
+                kwargs["catalog"] = self.catalog.warm()
+            except Exception as exc:
+                # Omitting the kwarg falls back to the agent's own introspection, which will
+                # report the failure through its error event. Handing over a half-built or empty
+                # catalog would be worse: the agent trusts a supplied catalog absolutely and
+                # would answer "No tables detected" for what is really a transient read failure.
+                logger.warning(f"Could not warm the catalog for this question: {exc}")
+
+        return kwargs
+
+    @staticmethod
+    def _accepts(agent, parameter: str) -> bool:
+        """Whether this agent build takes ``parameter=``.
+
+        Checked rather than assumed so the REPL works against agent builds both with and without
+        the pruning/catalog parameters, instead of dying with a TypeError on the first question.
         """
         try:
-            return "pinned_tables" in inspect.signature(agent.execute).parameters
+            return parameter in inspect.signature(agent.execute).parameters
         except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
             return False
 
