@@ -18,6 +18,7 @@ from typing import Iterable, List
 
 from prompt_toolkit.completion import Completer, Completion
 
+from schemapilot.names import completion_candidates
 from schemapilot.repl.commands import COMMANDS, COMMAND_ORDER
 
 
@@ -109,14 +110,10 @@ class SchemaPilotCompleter(Completer):
             yield Completion(name, start_position=-len(prefix), display_meta="pin this table")
 
     def _table_candidates(self, prefix: str) -> List[str]:
-        """Qualified names whose full or bare name starts with ``prefix`` (case-insensitive)."""
-        names = self.session.catalog.table_names()
-        if not prefix:
-            return names
-        lowered = prefix.lower()
-        matches = []
-        for qualified in names:
-            bare = qualified.rpartition(".")[2]
-            if qualified.lower().startswith(lowered) or bare.lower().startswith(lowered):
-                matches.append(qualified)
-        return matches
+        """Qualified names whose full or bare name starts with ``prefix`` (case-insensitive).
+
+        Delegates to :mod:`schemapilot.names` so completion normalises names exactly the way the
+        cache and pruning resolve them -- otherwise a name can complete here and then resolve to a
+        different table, or to none, further down.
+        """
+        return completion_candidates(prefix, self.session.catalog.table_names())

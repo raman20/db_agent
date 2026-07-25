@@ -13,6 +13,7 @@ from schemapilot.db import get_db
 from schemapilot.agent import SchemaPilotAgent
 from schemapilot.engines import engine_names, get_spec
 from schemapilot.llm import get_model_manager
+from schemapilot.rendering import print_result_rows
 from schemapilot.repl import ReplSession
 
 # Prompt text per connection field; the set of fields asked for comes from the engine spec.
@@ -32,6 +33,7 @@ FIELD_PROMPTS = {
 # SOTA Terminal visual imports
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
@@ -67,7 +69,9 @@ class SchemaPilotCLI:
         if event_type == "agent_message":
             # Direct logging if not wrapped in status status
             agent = event_data.get("agent", "Agent")
-            msg = event_data.get("message", "")
+            # escape(): agent messages quote table names, types and driver text, which routinely
+            # contain square brackets that Rich would read as a style tag and silently delete.
+            msg = escape(str(event_data.get("message", "")))
             self.console.print(f"\n{self.format_agent_name(agent)} {msg}")
             
         elif event_type == "final_output":
@@ -89,23 +93,12 @@ class SchemaPilotCLI:
                 expand=False
             ))
             
-            # Print Raw Data Table
-            if isinstance(raw_data, dict) and "rows" in raw_data and raw_data["rows"]:
-                cols = raw_data.get("columns", [])
-                rows = raw_data.get("rows", [])
-                
-                table = Table(show_header=True, header_style="bold cyan", border_style="dim")
-                for col in cols:
-                    table.add_column(col)
-                
-                # Show top 15 records
-                for row in rows[:15]:
-                    table.add_row(*[str(row.get(col) if row.get(col) is not None else "") for col in cols])
-                    
+            # Print Raw Data Table. The renderer is shared with /sql (schemapilot.rendering) so
+            # both surfaces truncate at the same row and escape cell content identically -- this
+            # path previously printed cells raw, so bracketed database values vanished.
+            if isinstance(raw_data, dict) and raw_data.get("rows"):
                 self.console.print("\n[bold cyan]📋 Results Preview:[/bold cyan]")
-                self.console.print(table)
-                if len(rows) > 15:
-                    self.console.print(f"[dim]* Truncated display preview to 15 of {len(rows)} total rows. *[/dim]")
+                print_result_rows(self.console, raw_data)
 
             # Print Summary MD
             self.console.print("\n[bold green]📊 Analysis Summary:[/bold green]")
@@ -115,7 +108,9 @@ class SchemaPilotCLI:
             self.history.append({"role": "assistant", "content": summary})
             
         elif event_type == "error":
-            err = event_data.get("error", "")
+            # escape(): driver and sentry messages carry brackets (`schemapilot[trino]`, array
+            # literals), and losing part of an error message is how a user fixes the wrong thing.
+            err = escape(str(event_data.get("error", "")))
             self.console.print(f"\n[bold red]❌ Error:[/bold red] {err}", style="red")
 
     async def execute_query(self, query):

@@ -14,9 +14,30 @@ from sqlalchemy import create_engine, text
 from schemapilot import db as db_module
 from schemapilot.catalog import SchemaCache
 from schemapilot.db import DatabaseManager
-from schemapilot.repl.commands import COMMANDS, COMMAND_ORDER, dispatch, handle_line, suggest
+from schemapilot.names import (
+    bare_name,
+    completion_candidates,
+    match_table_names,
+    normalise,
+    resolve_table_name,
+)
+from schemapilot.rendering import PREVIEW_ROWS
+from schemapilot.repl.commands import (
+    COMMANDS,
+    COMMAND_ORDER,
+    SQL_PREVIEW_ROWS,
+    _render_result,
+    dispatch,
+    handle_line,
+    suggest,
+)
 from schemapilot.repl.completion import SchemaPilotCompleter
-from schemapilot.repl.session import ReplSession
+from schemapilot.repl.session import (
+    NO_CONNECTION_ACTION,
+    NO_CONNECTION_HEADLINE,
+    PROVIDER_API_KEY_ENV,
+    ReplSession,
+)
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -351,11 +372,15 @@ def test_sql_uses_the_spec_dialect_not_the_sqlalchemy_dialect_name(session, monk
 # --------------------------------------------------------------------------- /why
 
 
-def test_why_is_honest_before_pruning_lands(session):
+def test_why_says_nothing_is_recorded_before_the_first_question(session):
+    """Two legitimate causes: no question yet, or a question that died before pruning ran. The
+    message must cover both without claiming pruning is missing -- it has landed."""
     handle_line(session, "/why")
     text_out = output(session)
     assert "No table-selection decision recorded" in text_out
-    assert "not yet enabled" in text_out
+    assert "before table selection ran" in text_out
+    # Pruning is real now, so /why must not tell the user it is absent from the build.
+    assert "not yet enabled" not in text_out
 
 
 def test_why_reports_a_recorded_selection(session):
@@ -364,6 +389,40 @@ def test_why_reports_a_recorded_selection(session):
     text_out = output(session)
     assert "orders" in text_out
     assert "0.91" in text_out
+
+
+def test_why_reports_the_reason_pruning_recorded_per_table(session):
+    """A score alone does not explain a selection: a pinned table scores 0.00 and is still sent."""
+    session.last_selection = {
+        "tables": ["orders", "customers"],
+        "scores": {"orders": 0.0, "customers": 1.4},
+        "reasons": {"orders": "pinned with @", "customers": "lexical match (score 1)"},
+        "strategy": "pruned",
+    }
+    handle_line(session, "/why")
+    text_out = output(session)
+    assert "pinned with @" in text_out
+    assert "lexical match" in text_out
+
+
+@pytest.mark.parametrize(
+    "strategy,expected",
+    [
+        ("pruned", "only the tables below were sent"),
+        ("full-catalog", "every table was sent and nothing was pruned"),
+        ("empty-catalog", "catalog was empty"),
+    ],
+)
+def test_why_explains_the_pruning_strategy_in_words(session, strategy, expected):
+    """`full-catalog` printed raw reads like "pruning is off"; it means "nothing needed pruning"."""
+    session.last_selection = {
+        "tables": ["orders"],
+        "scores": {"orders": 0.5},
+        "reasons": {},
+        "strategy": strategy,
+    }
+    handle_line(session, "/why")
+    assert expected in output(session)
 
 
 # --------------------------------------------------------------------------- /engines, /help, /exit
@@ -566,7 +625,8 @@ def test_schema_selection_event_is_captured_into_last_selection(session, monkeyp
     record = {}
     _install_fake_agent(
         monkeypatch,
-        ['{"event": "schema_selection", "tables": ["orders"], "scores": {"orders": 0.5}}\n'],
+        ['{"event": "schema_selection", "tables": ["orders"], "scores": {"orders": 0.5}, '
+         '"reasons": {"orders": "pinned with @"}, "strategy": "pruned"}\n'],
         record,
     )
 
@@ -574,7 +634,12 @@ def test_schema_selection_event_is_captured_into_last_selection(session, monkeyp
     session.pin_table("orders")
     session.ask("who spends the most?")
 
-    assert session.last_selection == {"tables": ["orders"], "scores": {"orders": 0.5}}
+    assert session.last_selection == {
+        "tables": ["orders"],
+        "scores": {"orders": 0.5},
+        "reasons": {"orders": "pinned with @"},
+        "strategy": "pruned",
+    }
     assert record["pinned_tables"] == ["orders"]
     # Stored, not printed.
     assert "schema_selection" not in output(session)
@@ -712,3 +777,236 @@ def test_one_shot_cli_path_passes_no_catalog(session):
 
 def test_status_line_advertises_read_only(session):
     assert " · ro]" in session.status_line()
+
+
+# ------------------------------------------------------------- one name resolver, one policy
+
+
+def _AMBIGUOUS():
+    """Two schemas holding a table of the same leaf name -- the case the three old resolvers
+    each answered differently."""
+    return ["archive.orders", "sales.orders", "sales.customers"]
+
+
+def test_bare_name_splits_on_the_last_dot():
+    """Correct for 1-, 2- and 3-part names alike."""
+    assert bare_name("tpch.tiny.orders") == "orders"
+    assert bare_name("sales.orders") == "orders"
+    assert bare_name("orders") == "orders"
+
+
+@pytest.mark.parametrize("typed", ['"orders"', "`orders`", "@orders", "  ORDERS  ", "[orders]"])
+def test_normalise_strips_quotes_at_signs_and_case(typed):
+    assert normalise(typed) == "orders"
+
+
+def test_exact_match_wins_over_looser_tiers():
+    """A fully-qualified name must never be diluted by suffix or leaf matches."""
+    assert match_table_names("sales.orders", _AMBIGUOUS()) == ["sales.orders"]
+    assert resolve_table_name("sales.orders", _AMBIGUOUS()) == "sales.orders"
+
+
+def test_dotted_suffix_resolves_a_partially_qualified_name():
+    assert resolve_table_name("tiny.orders", ["tpch.tiny.orders", "tpch.sf1.lineitem"]) == "tpch.tiny.orders"
+
+
+def test_leaf_name_resolves_when_it_is_unique():
+    assert resolve_table_name("customers", _AMBIGUOUS()) == "sales.customers"
+
+
+def test_ambiguity_never_resolves_silently():
+    """The whole point of this module. Alphabetically-first would return archive.orders -- the
+    stale copy -- and pruning's old behaviour dropped the pin with no explanation."""
+    assert resolve_table_name("orders", _AMBIGUOUS()) is None
+    # ...but the collision is retrievable, so a caller can name both tables.
+    assert match_table_names("orders", _AMBIGUOUS()) == ["archive.orders", "sales.orders"]
+
+
+def test_an_unknown_name_matches_nothing():
+    assert match_table_names("nope", _AMBIGUOUS()) == []
+    assert resolve_table_name("nope", _AMBIGUOUS()) is None
+    assert resolve_table_name("", _AMBIGUOUS()) is None
+
+
+def test_completion_matches_prefixes_of_either_the_qualified_or_the_leaf_name():
+    """Distinct from resolution on purpose: completion works on a half-typed word."""
+    assert completion_candidates("ord", _AMBIGUOUS()) == ["archive.orders", "sales.orders"]
+    assert completion_candidates("sales.", _AMBIGUOUS()) == ["sales.customers", "sales.orders"]
+    assert completion_candidates("", _AMBIGUOUS()) == sorted(_AMBIGUOUS())
+
+
+def test_the_completer_and_the_cache_agree_about_an_ambiguous_name(session, monkeypatch):
+    """The bug this replaced: `@orders` completed, resolved to a DIFFERENT table for /schema, and
+    was then dropped before it reached the prompt -- three answers to one question."""
+    monkeypatch.setattr(session.catalog, "table_names", lambda: _AMBIGUOUS())
+    monkeypatch.setattr(type(session.catalog), "is_warm", property(lambda self: True))
+
+    completer = SchemaPilotCompleter(session)
+    completions = [c.text for c in completer.get_completions(Document("count @ord"), None)]
+
+    # Completion offers both, so the user can see there is a choice to make...
+    assert completions == ["archive.orders", "sales.orders"]
+    # ...and neither the cache nor the pin picks one arbitrarily.
+    assert session.catalog.resolve("orders") is None
+    assert session.catalog.candidates("orders") == ["archive.orders", "sales.orders"]
+
+
+def test_an_ambiguous_completion_pins_nothing(session, monkeypatch):
+    """Only an unambiguous single candidate is pinned; guessing here would silently steer the
+    prompt at the wrong schema."""
+    monkeypatch.setattr(session.catalog, "table_names", lambda: _AMBIGUOUS())
+    monkeypatch.setattr(type(session.catalog), "is_warm", property(lambda self: True))
+
+    completer = SchemaPilotCompleter(session)
+    list(completer.get_completions(Document("count @ord"), None))
+    assert session.pinned_tables == []
+
+
+def test_schema_on_an_ambiguous_name_refuses_instead_of_guessing(session, monkeypatch):
+    monkeypatch.setattr(session.catalog, "table_names", lambda: _AMBIGUOUS())
+    monkeypatch.setattr(type(session.catalog), "is_warm", property(lambda self: True))
+
+    handle_line(session, "/schema orders")
+    text_out = output(session)
+    assert "archive.orders" in text_out
+    assert "sales.orders" in text_out
+
+
+def test_a_cold_cache_resolves_nothing(session):
+    """Resolution reads cached state only; a cold cache must not look like an empty database."""
+    session.catalog.invalidate()
+    assert session.catalog.resolve("orders") is None
+    assert session.catalog.candidates("orders") == []
+
+
+# ------------------------------------------------------------- one escaped row renderer
+
+
+BRACKETED_ROWS = {
+    "columns": ["label", "payload"],
+    # Real database content that Rich reads as markup: a Postgres array literal, an array type
+    # name, and a product literally called [legacy].
+    "rows": [{"label": "[legacy]", "payload": "[1,2,3]"}],
+}
+
+
+def test_result_cells_containing_brackets_are_not_eaten_as_markup(session):
+    """Rich deletes unrecognised style tags, so an unescaped cell shows the user a WRONG value
+    with nothing to indicate text went missing."""
+    _render_result(session, BRACKETED_ROWS)
+    text_out = output(session)
+    assert "[legacy]" in text_out
+    assert "[1,2,3]" in text_out
+
+
+def test_the_one_shot_cli_path_escapes_result_cells_too(session, tmp_path):
+    """The bug: /sql escaped its cells but `schemapilot "question"` did not, so the same value
+    printed correctly in the REPL and corrupted on the command line."""
+    from schemapilot.cli import SchemaPilotCLI
+
+    cli = SchemaPilotCLI.__new__(SchemaPilotCLI)
+    cli.history = []
+    cli.console = Console(record=True, width=140, force_terminal=False, no_color=True)
+
+    cli.handle_event({
+        "event": "swarm_completed",
+        "sql": "SELECT 1",
+        "summary": "done",
+        "raw_data": BRACKETED_ROWS,
+    })
+    text_out = cli.console.export_text()
+    assert "[legacy]" in text_out
+    assert "[1,2,3]" in text_out
+
+
+def test_agent_messages_and_errors_are_escaped_on_the_one_shot_path(session):
+    """Losing half an error message is how a user fixes the wrong thing: install_hint() returns
+    `pip install 'schemapilot[trino]'` and Rich would delete the `[trino]`."""
+    from schemapilot.cli import SchemaPilotCLI
+
+    cli = SchemaPilotCLI.__new__(SchemaPilotCLI)
+    cli.history = []
+    cli.console = Console(record=True, width=200, force_terminal=False, no_color=True)
+
+    cli.handle_event({"event": "error", "error": "install pip install 'schemapilot[trino]'"})
+    cli.handle_event({"event": "agent_message", "agent": "Architect", "message": "reading col[0]"})
+    text_out = cli.console.export_text()
+    assert "schemapilot[trino]" in text_out
+    assert "col[0]" in text_out
+
+
+def test_both_surfaces_truncate_at_the_same_row(session):
+    """Two renderers with caps of 15 and 25 meant the same result printed differently depending
+    on which surface you asked from -- a difference with no meaning behind it."""
+    assert SQL_PREVIEW_ROWS == PREVIEW_ROWS
+
+    rows = [{"n": i} for i in range(PREVIEW_ROWS + 5)]
+    _render_result(session, {"columns": ["n"], "rows": rows})
+    text_out = output(session)
+    assert f"Showing {PREVIEW_ROWS} of {len(rows)} rows" in text_out
+    assert str(PREVIEW_ROWS - 1) in text_out
+    # The row just past the cap is not printed.
+    assert f"| {PREVIEW_ROWS} " not in text_out
+
+
+def test_a_payload_with_no_rows_key_prints_the_drivers_message_escaped(session):
+    """Statements returning no result set come back as {"message": ...}, not a row list."""
+    _render_result(session, {"message": "ok [done]"})
+    assert "ok [done]" in output(session)
+
+
+def test_an_empty_row_list_says_zero_rows(session):
+    _render_result(session, {"columns": ["n"], "rows": []})
+    assert "0 rows" in output(session)
+
+
+# ------------------------------------------------------------- small consolidations
+
+
+def test_a_question_with_no_connection_gives_the_same_fix_as_a_command(session):
+    """The headline and its one action had three verbatim copies; they must not drift."""
+    session.db.active_id = None
+
+    session.ask("who spends the most?")
+    handle_line(session, "/tables")
+    described = session.describe_error(RuntimeError("No active database connection selected"))
+
+    text_out = output(session)
+    assert text_out.count(NO_CONNECTION_HEADLINE) == 2
+    assert text_out.count("--list-conns") == 2
+    assert described == {"headline": NO_CONNECTION_HEADLINE, "action": NO_CONNECTION_ACTION}
+
+
+def test_the_provider_env_var_map_matches_what_llm_actually_reads():
+    """session.py names the env var in an auth error while llm.get_llm reads it inline; llm.py
+    exposes no mapping to import, so this test is the guard against the copy drifting."""
+    import inspect as _inspect
+
+    from schemapilot import llm as llm_module
+
+    source = _inspect.getsource(llm_module.get_llm)
+    for provider, env_var in PROVIDER_API_KEY_ENV.items():
+        assert env_var in source, f"{env_var} is claimed for '{provider}' but llm.py never reads it"
+        assert provider in source
+
+    # And the reverse: a provider key added to llm.py must be added here too, or an auth error
+    # will send the user to set LLM_API_KEY when the code reads something else.
+    import re
+
+    read_vars = set(re.findall(r'os\.getenv\("([A-Z_]*API_KEY)"', source))
+    assert read_vars - set(PROVIDER_API_KEY_ENV.values()) <= {"LLM_API_KEY"}
+
+
+def test_an_llm_auth_error_names_the_variable_for_the_active_provider(session):
+    described = session.describe_error(ValueError("OpenAI API key is missing"))
+    assert "GOOGLE_API_KEY" in described["action"]  # the stub profile's provider
+
+
+def test_the_repl_log_lives_in_the_shared_config_dir():
+    """USER_CONFIG_DIR had three independent definitions; a REPL log under a different one is a
+    log the rest of the CLI does not look for."""
+    from schemapilot import paths
+    from schemapilot.repl import session as session_module
+
+    assert session_module.USER_CONFIG_DIR is paths.USER_CONFIG_DIR
+    assert session_module.LOG_FILE.startswith(paths.USER_CONFIG_DIR)

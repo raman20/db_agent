@@ -26,11 +26,35 @@ from schemapilot.catalog import SchemaCache
 from schemapilot.config import settings
 from schemapilot.db import get_db
 from schemapilot.llm import get_model_manager
+from schemapilot.paths import USER_CONFIG_DIR
 
 logger = logging.getLogger("schemapilot.repl")
 
-USER_CONFIG_DIR = os.path.expanduser("~/.config/schemapilot")
+# USER_CONFIG_DIR is owned by schemapilot.paths -- this module used to define its own copy, which
+# is how a REPL log could land somewhere the rest of the CLI did not look.
 LOG_FILE = os.path.join(USER_CONFIG_DIR, "schemapilot.log")
+
+#: The "nothing is connected" headline and its single action, defined once. Reached from three
+#: directions -- a command that needs a connection, a question, and an exception whose text says
+#: so -- and the whole point of the one-headline-one-action shape is that the user sees the same
+#: fix every time.
+NO_CONNECTION_HEADLINE = "No active database connection"
+NO_CONNECTION_ACTION = "Run `schemapilot --list-conns` to see profiles, then `/use <name>` here."
+
+#: Which environment variable ``schemapilot.llm.get_llm`` reads for each provider, so an auth
+#: failure can name the exact variable rather than a generic "set your API key".
+#:
+#: This mirrors the per-provider branches in ``get_llm`` instead of importing a mapping, because
+#: ``llm.py`` does not expose one -- it reads the variables inline. Rather than let the copy drift
+#: silently, ``tests/test_repl_commands.py`` asserts every name here appears in ``llm.py``'s
+#: source and vice versa, so adding a provider there fails the suite until it is added here.
+#: Providers absent from this map fall back to LLM_API_KEY, which is what ``get_llm`` reads for
+#: local/ollama/openai-compatible.
+PROVIDER_API_KEY_ENV = {
+    "google": "GOOGLE_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
 
 
 class ReplSession:
@@ -156,22 +180,15 @@ class ReplSession:
             return self._llm_auth_error(text)
 
         # 4. Nothing connected.
-        if "no active database connection" in lowered:
-            return {
-                "headline": "No active database connection",
-                "action": "Run `schemapilot --list-conns` to see profiles, then `/use <name>` here.",
-            }
+        if NO_CONNECTION_HEADLINE.lower() in lowered:
+            return {"headline": NO_CONNECTION_HEADLINE, "action": NO_CONNECTION_ACTION}
 
         return {"headline": text or type(error).__name__, "action": ""}
 
     def _llm_auth_error(self, text: str) -> Dict[str, str]:
         """Names the env var actually consulted for the active provider."""
         provider = str(self.model_manager.get_active_profile().get("provider") or "google").lower()
-        env_var = {
-            "google": "GOOGLE_API_KEY",
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-        }.get(provider, "LLM_API_KEY")
+        env_var = PROVIDER_API_KEY_ENV.get(provider, "LLM_API_KEY")
         return {
             "headline": f"LLM authentication failed for provider '{provider}'",
             "action": (
@@ -248,11 +265,11 @@ class ReplSession:
 
     def ask(self, question: str):
         """Runs a natural-language question through the agent swarm."""
-        if not self.db.active_id:
-            self.fail(
-                "No active database connection",
-                "Run `schemapilot --list-conns` to see profiles, then `/use <name>` here.",
-            )
+        # Shared with the commands so the headline and the one action have a single definition;
+        # three copies of the same "not connected" text drift apart the moment one is reworded.
+        from schemapilot.repl.commands import _require_connection
+
+        if not _require_connection(self):
             return
 
         pinned = list(self.pinned_tables)
@@ -286,10 +303,14 @@ class ReplSession:
                     continue
 
                 if event.get("event") == "schema_selection":
-                    # Stored, not printed: /why is where the user asks for it.
+                    # Stored, not printed: /why is where the user asks for it. `reasons` and
+                    # `strategy` are kept too -- a score alone does not explain why a table was
+                    # sent (pinned, FK neighbour and lexical match all land in the same list).
                     self.last_selection = {
                         "tables": event.get("tables") or [],
                         "scores": event.get("scores") or {},
+                        "reasons": event.get("reasons") or {},
+                        "strategy": event.get("strategy") or "",
                     }
                 elif event.get("event") == "agent_message":
                     name = event.get("agent", "Agent")
@@ -313,11 +334,12 @@ class ReplSession:
         ``SchemaCache``: the agent must stay usable by callers that have no session.
         """
         kwargs: Dict[str, Any] = {}
+        accepted = self._accepted_parameters(agent)
 
-        if pinned and self._accepts(agent, "pinned_tables"):
+        if pinned and "pinned_tables" in accepted:
             kwargs["pinned_tables"] = pinned
 
-        if self._accepts(agent, "catalog"):
+        if "catalog" in accepted:
             try:
                 # warm() is a no-op when /use already warmed it; on the first question of a
                 # cold session it does the one fetch this session will ever need.
@@ -332,16 +354,18 @@ class ReplSession:
         return kwargs
 
     @staticmethod
-    def _accepts(agent, parameter: str) -> bool:
-        """Whether this agent build takes ``parameter=``.
+    def _accepted_parameters(agent) -> frozenset:
+        """The keyword parameters this agent build's ``execute`` declares.
 
-        Checked rather than assumed so the REPL works against agent builds both with and without
-        the pruning/catalog parameters, instead of dying with a TypeError on the first question.
+        Introspected for ONE reason: ``SchemaPilotAgent`` is importable as a library, so a caller
+        can pin an older ``schemapilot`` whose ``execute`` predates ``catalog=``/``pinned_tables=``
+        and still drive this session. Passing an unknown kwarg there is a ``TypeError`` on the
+        user's first question -- a signature check is a cheap way to degrade instead.
         """
         try:
-            return parameter in inspect.signature(agent.execute).parameters
+            return frozenset(inspect.signature(agent.execute).parameters)
         except (TypeError, ValueError):  # pragma: no cover - builtins/C callables
-            return False
+            return frozenset()
 
     # ------------------------------------------------------------------ default rendering
 

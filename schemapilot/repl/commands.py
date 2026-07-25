@@ -17,17 +17,19 @@ together with the interactive approval panel that would make it reviewable.
 
 import difflib
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
 from rich.markup import escape
 from rich.table import Table
 from rich.tree import Tree
 
 from schemapilot.engines import ENGINES, driver_available
+from schemapilot.rendering import PREVIEW_ROWS, print_result_rows
 from schemapilot.security import validate_sql_query
 
-#: How many rows of a /sql result to print before truncating the preview.
-SQL_PREVIEW_ROWS = 25
+#: Kept as an alias so the row cap has one definition (schemapilot.rendering) shared with the
+#: non-interactive `schemapilot "question"` path.
+SQL_PREVIEW_ROWS = PREVIEW_ROWS
 
 
 @dataclass(frozen=True)
@@ -49,10 +51,10 @@ def _require_connection(session) -> bool:
     """Prints the one-action fix and returns False when nothing is connected."""
     if session.db.active_id:
         return True
-    session.fail(
-        "No active database connection",
-        "Run `schemapilot --list-conns` to see profiles, then `/use <name>` here.",
-    )
+    # Imported lazily: session.py calls this helper too, so a module-level import would be a cycle.
+    from schemapilot.repl.session import NO_CONNECTION_ACTION, NO_CONNECTION_HEADLINE
+
+    session.fail(NO_CONNECTION_HEADLINE, NO_CONNECTION_ACTION)
     return False
 
 
@@ -218,7 +220,21 @@ def cmd_schema(session, args: str):
     if target:
         resolved = session.catalog.resolve(target)
         if resolved is None:
-            session.fail(f"Table '{target}' is not in the cached catalog", "Run `/tables` to see the cached names.")
+            # Ambiguous and unknown both resolve to None, but they need different actions: "not in
+            # the catalog" is a lie when the table exists twice, and it sends the user to /tables
+            # to look for something they will find. Name the collision instead.
+            candidates = session.catalog.candidates(target)
+            if len(candidates) > 1:
+                # No escape() here: session.fail() escapes both strings itself.
+                session.fail(
+                    f"'{target}' is ambiguous: {', '.join(candidates)}",
+                    f"Qualify it, e.g. `/schema {candidates[0]}`.",
+                )
+            else:
+                session.fail(
+                    f"Table '{target}' is not in the cached catalog",
+                    "Run `/tables` to see the cached names.",
+                )
             return
         tree = Tree(f"[bold cyan]{escape(resolved)}[/bold cyan]")
         for column in session.catalog.columns(resolved):
@@ -277,51 +293,61 @@ def cmd_sql(session, args: str):
 
 
 def _render_result(session, result: Dict[str, object]):
-    """Prints an ``execute_query`` payload: ``{"columns": [...], "rows": [...]}`` or a message."""
-    if not isinstance(result, dict) or "rows" not in result:
-        session.console.print(str((result or {}).get("message", result)))
+    """Prints an ``execute_query`` payload, or the driver's message when there are no rows.
+
+    The table itself comes from :mod:`schemapilot.rendering`, shared with the non-interactive
+    path, so both surfaces truncate at the same row and escape cell content identically.
+    """
+    if print_result_rows(session.console, result, max_rows=SQL_PREVIEW_ROWS):
         return
+    # No "rows" key: a statement that returns none. escape() because the driver's message is
+    # arbitrary text that may contain brackets.
+    session.console.print(escape(str((result or {}).get("message", result))))
 
-    columns: List[str] = list(result.get("columns") or [])
-    rows: List[Dict[str, object]] = list(result.get("rows") or [])
-    if not rows:
-        session.console.print("[dim]0 rows.[/dim]")
-        return
 
-    table = Table(show_header=True, header_style="bold cyan", border_style="dim")
-    for column in columns:
-        table.add_column(escape(str(column)))
-    for row in rows[:SQL_PREVIEW_ROWS]:
-        # escape(): result cells are arbitrary database content and must never be interpreted
-        # as Rich markup.
-        table.add_row(*["" if row.get(c) is None else escape(str(row.get(c))) for c in columns])
-
-    session.console.print(table)
-    if len(rows) > SQL_PREVIEW_ROWS:
-        session.console.print(f"[dim]Showing {SQL_PREVIEW_ROWS} of {len(rows)} rows.[/dim]")
+#: How pruning's `strategy` value reads to a user. Kept as a mapping rather than printed raw so
+#: `full-catalog` is not mistaken for "pruning is off".
+_STRATEGY_NOTES = {
+    "empty-catalog": "The catalog was empty, so no table schema was sent at all.",
+    "full-catalog": "The database is under MAX_PROMPT_TABLES, so every table was sent and nothing was pruned.",
+    "pruned": "The database is over MAX_PROMPT_TABLES, so only the tables below were sent.",
+}
 
 
 def cmd_why(session, args: str):
     """`/why` -- report which tables the last question sent to the model, and why."""
     selection = session.last_selection
     if not selection or not selection.get("tables"):
-        # Honest rather than crashing: table pruning is T6's, and until its schema_selection
-        # event arrives there is genuinely nothing to explain.
+        # Reached in two legitimate ways: no question has been asked yet, or the last question
+        # never got as far as selecting tables (an LLM or connection error before pruning ran).
         session.console.print(
             "[yellow]No table-selection decision recorded.[/yellow]\n"
-            "  [dim]Ask a question first. If this persists, table pruning is not yet enabled "
-            "in this build and the full catalog is sent.[/dim]"
+            "  [dim]Ask a question first. If you did and this persists, the question failed "
+            "before table selection ran -- the error above says why.[/dim]"
         )
         return
 
     scores = selection.get("scores") or {}
+    reasons = selection.get("reasons") or {}
     table = Table(show_header=True, header_style="bold blue", border_style="dim")
     table.add_column("Table sent to the model")
     table.add_column("Relevance score", justify="right")
+    # "Why" is the point of the command, so the reason pruning recorded is a column, not a
+    # footnote: a score of 0.00 next to "pinned with @" is a very different story to one next to
+    # "lexical match".
+    table.add_column("Why")
     for name in selection["tables"]:
         score = scores.get(name)
-        table.add_row(escape(str(name)), "—" if score is None else f"{float(score):.2f}")
+        table.add_row(
+            escape(str(name)),
+            "—" if score is None else f"{float(score):.2f}",
+            escape(str(reasons.get(name, "—"))),
+        )
     session.console.print(table)
+
+    note = _STRATEGY_NOTES.get(selection.get("strategy") or "")
+    if note:
+        session.console.print(f"[dim]{escape(note)}[/dim]")
     if session.pinned_tables:
         session.console.print(f"[dim]Pinned for the next question: {', '.join(session.pinned_tables)}[/dim]")
 

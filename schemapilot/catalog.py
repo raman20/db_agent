@@ -23,6 +23,8 @@ import fnmatch
 import logging
 from typing import Any, Dict, List, Optional
 
+from schemapilot.names import match_table_names, resolve_table_name
+
 logger = logging.getLogger("schemapilot.catalog")
 
 
@@ -45,10 +47,6 @@ class SchemaCache:
         self._fk_index: Dict[str, Dict[str, str]] = {}
 
     # ------------------------------------------------------------------ state
-
-    @property
-    def connection_id(self) -> Optional[str]:
-        return self._connection_id
 
     @property
     def is_warm(self) -> bool:
@@ -92,10 +90,6 @@ class SchemaCache:
         self._connection_id = self.db.active_id
         self._fk_index = self._build_fk_index(metadata)
         return metadata
-
-    def refresh(self) -> Dict[str, Any]:
-        """Re-introspects the active connection unconditionally."""
-        return self.warm(force=True)
 
     @staticmethod
     def _build_fk_index(metadata: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
@@ -166,32 +160,26 @@ class SchemaCache:
             for column in info.get("columns") or []
         ]
 
-    def relationships(self) -> List[Dict[str, Any]]:
+    def resolve(self, name: str) -> Optional[str]:
+        """The single qualified table a user-typed name means, or None if none or several.
+
+        Delegates to :func:`schemapilot.names.resolve_table_name` so the cache, the completer and
+        pruning cannot disagree about what ``@orders`` refers to. Ambiguity returns None on
+        purpose -- see that module's docstring; use :meth:`candidates` to tell the user which
+        tables collided.
+        """
+        if not self.is_warm:
+            return None
+        return resolve_table_name(name, self.table_names())
+
+    def candidates(self, name: str) -> List[str]:
+        """Every qualified table a name could mean, so a caller can name the collision.
+
+        One entry means unambiguous, several mean the user must qualify it, none mean unknown.
+        """
         if not self.is_warm:
             return []
-        return list(self._metadata.get("relationships") or [])
-
-    def resolve(self, name: str) -> Optional[str]:
-        """Maps user input to a qualified table name.
-
-        Accepts the qualified name, the bare table name, or any dotted suffix, because the user
-        types ``@orders`` while the catalog is keyed ``tpch.tiny.orders``. Case-insensitive;
-        ambiguity resolves to the alphabetically first match so behaviour is deterministic.
-        """
-        if not name or not self.is_warm:
-            return None
-        needle = name.strip().strip('"').strip("`").lower()
-        if not needle:
-            return None
-
-        candidates = self.table_names()
-        for qualified in candidates:
-            if qualified.lower() == needle:
-                return qualified
-        for qualified in candidates:
-            if qualified.lower().endswith("." + needle):
-                return qualified
-        return None
+        return match_table_names(name, self.table_names())
 
     def match(self, pattern: Optional[str] = None) -> List[str]:
         """Table names filtered by a shell glob (``/tables sales_*``).
