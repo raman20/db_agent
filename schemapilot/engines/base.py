@@ -93,6 +93,14 @@ class EngineSpec:
     #: ``"composite"`` -> it returns ``db.schema`` pairs (DuckDB), parsed on the last dot.
     schema_name_style: str = "plain"
 
+    #: Which connection-profile key holds the namespace introspection should reflect, or None
+    #: when the engine has no schema level to scope to. Declared per engine because the key
+    #: DIFFERS from the SQL concept: MySQL and ClickHouse call their schema level a "database"
+    #: and collect it as ``database``, while PostgreSQL and Trino collect ``schema`` alongside a
+    #: separate database/catalog. Assuming ``schema`` everywhere made introspection enumerate
+    #: every accessible MySQL/ClickHouse database instead of the configured one.
+    introspection_namespace_field: str = None
+
     #: Human-readable note about cross-engine reach, or None. Deliberately not called
     #: "federation", which would overclaim.
     cross_engine_via: str = None

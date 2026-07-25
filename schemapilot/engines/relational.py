@@ -21,6 +21,8 @@ POSTGRES = EngineSpec(
     quote_char='"',
     readonly_commands=frozenset(),
     system_schemas=frozenset({"information_schema", "pg_catalog", "pg_toast"}),
+    # Postgres collects `database` and `schema` separately; the schema is the namespace.
+    introspection_namespace_field="schema",
     dangerous_functions=_FILESYSTEM_FUNCS
     | {"pg_read_file", "pg_read_binary_file", "pg_write_file", "pg_ls_dir", "lo_import", "lo_export"},
     dangerous_nodes=frozenset({"Copy"}),
@@ -41,6 +43,8 @@ MYSQL = EngineSpec(
     # from the default because SQLite and DuckDB do support it.
     readonly_nodes=frozenset({"Show", "Describe"}),
     system_schemas=frozenset({"information_schema", "mysql", "performance_schema", "sys"}),
+    # MySQL's schema level IS its database, and that is the key --add-conn collects.
+    introspection_namespace_field="database",
     dangerous_functions=_FILESYSTEM_FUNCS,
 )
 

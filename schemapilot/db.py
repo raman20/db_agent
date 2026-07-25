@@ -217,41 +217,61 @@ class DatabaseManager:
                     pass
 
     def select_connection(self, conn_id: str, persist: bool = True) -> bool:
-        """Sets the active connection and initializes the engines."""
+        """Sets the active connection and initializes the engines.
+
+        The candidate is built and probed BEFORE any state is swapped, so a failed switch is a
+        no-op: the previous connection keeps working and the caller stays on a database it can
+        actually query. Losing a good connection to a typo in another profile is a bad trade.
+        """
         if conn_id not in self.connections:
             return False
 
         config = self.connections[conn_id]
         spec = self.spec_for(config)
 
-        # Drop the previous engine's pool before replacing it, otherwise switching connections
-        # leaks a live pool per switch for the lifetime of the process.
-        self._dispose_engine()
-
+        candidate = None
         try:
             logger.info(f"Connecting to database '{conn_id}' using engine: {spec.name}")
-            self.engine = self._create_engine(config, spec)
-            self._probe(self.engine, spec)
-
-            self.langchain_db = SQLDatabase(
-                self.engine,
+            candidate = self._create_engine(config, spec)
+            self._probe(candidate, spec)
+            candidate_langchain_db = SQLDatabase(
+                candidate,
                 sample_rows_in_table_info=3,
                 max_string_length=1000,
             )
-            self.active_id = conn_id
-            if persist:
-                self._persist_active(conn_id)
-            logger.info(f"Switched active database to: {conn_id}")
-            return True
-        except ConnectionError:
-            self._dispose_engine()
-            raise
         except Exception as e:
-            self._dispose_engine()
+            # Nothing has been swapped, so only the candidate needs cleaning up.
+            if candidate is not None:
+                try:
+                    candidate.dispose()
+                except Exception:  # pragma: no cover
+                    pass
             # `e` can embed the URI; specs build URLs whose repr masks the password, but never
             # log the raw config.
             logger.error(f"Failed to connect to database '{conn_id}': {e}")
+            if isinstance(e, ConnectionError):
+                raise
             raise ConnectionError(f"Database connection failed: {e}")
+
+        # The candidate is proven usable; swap all four pieces of state together so that
+        # active_id, active_spec, active_config, engine and langchain_db can never disagree.
+        previous_engine = self.engine
+        self.engine = candidate
+        self.langchain_db = candidate_langchain_db
+        self.active_id = conn_id
+
+        # Only now release the old pool: otherwise switching connections leaks a live pool per
+        # switch for the lifetime of the process.
+        if previous_engine is not None:
+            try:
+                previous_engine.dispose()
+            except Exception as e:  # pragma: no cover - dispose rarely fails
+                logger.debug(f"Engine dispose failed: {e}")
+
+        if persist:
+            self._persist_active(conn_id)
+        logger.info(f"Switched active database to: {conn_id}")
+        return True
 
     def _persist_active(self, conn_id: str):
         """Records which profile is active so the next process starts on the same database."""
@@ -313,18 +333,24 @@ class DatabaseManager:
         """Decides which schemas to reflect, in a deliberate order of precedence.
 
         1. an explicit `schemas=` argument,
-        2. else the schema configured on the connection profile,
+        2. else the namespace configured on the connection profile,
         3. else enumerate `get_schema_names()` (only meaningful when names have >= 2 parts).
 
         The order is load-bearing, not cosmetic: Trino's `tpch` catalog exposes `sf1`, `sf100`
         and `sf1000` next to `tiny`, so blind enumeration burns the whole table budget on
         schemas the user never asked about and never reaches the configured one.
+
+        Which profile key holds that namespace is spec data, NOT a fixed `"schema"` lookup:
+        MySQL and ClickHouse call their schema level a "database" and store it as `database`, so
+        hardcoding `"schema"` silently skipped step 2 for both and enumerated every accessible
+        database instead (verified live on ClickHouse: `default` alongside the configured one).
         """
         if schemas:
             return [s for s in schemas if s]
 
         if spec.sql_name_parts >= 2:
-            configured = config.get("schema")
+            namespace_field = spec.introspection_namespace_field
+            configured = config.get(namespace_field) if namespace_field else None
             if configured:
                 return [configured]
             return self._enumerate_schemas(inspector, spec)

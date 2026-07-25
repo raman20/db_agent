@@ -46,6 +46,9 @@ DUCKDB = EngineSpec(
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC"}),
     system_schemas=frozenset({"system", "temp", "information_schema", "pg_catalog"}),
     schema_name_style="composite",
+    # --add-conn only asks DuckDB for a path, but a profile may still carry an explicit `schema`
+    # (a `db.schema` composite) to scope a large file; honour it rather than enumerating.
+    introspection_namespace_field="schema",
     dangerous_functions=frozenset(
         {"read_csv_auto", "read_json", "read_json_auto", "read_text", "read_blob", "glob", "sniff_csv"}
     ),
@@ -123,6 +126,9 @@ TRINO = EngineSpec(
     supports_safe_dry_run=False,
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC"}),
     system_schemas=frozenset({"information_schema"}),
+    # Trino collects `catalog` and `schema` separately; the schema is the namespace, and
+    # honouring it is what stops tpch enumeration (sf1/sf100/sf1000) eating the table cap.
+    introspection_namespace_field="schema",
     cross_engine_via="configured Trino catalogs",
     prompt_notes=(
         "Trino exposes no foreign-key metadata: do not invent joins that the schema does not "
@@ -153,6 +159,10 @@ CLICKHOUSE = EngineSpec(
     # node as SHOW, but they mutate server state.
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC", "EXISTS"}),
     system_schemas=frozenset({"system", "information_schema", "INFORMATION_SCHEMA"}),
+    # Like MySQL, ClickHouse's schema level IS its database. Without this, introspection
+    # enumerated every accessible database (verified live: `default` alongside the configured
+    # one), letting an unrelated database consume the table cap and reach the prompt.
+    introspection_namespace_field="database",
     # Stored lowercase: the check compares against node.name.lower(), so "remoteSecure"
     # as written would never match.
     dangerous_functions=frozenset(

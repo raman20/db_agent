@@ -266,6 +266,85 @@ def test_single_part_engine_ignores_schema_enumeration(sqlite_db):
     assert inspector_schemas == [None]
 
 
+@pytest.mark.parametrize(
+    "db_type, namespace_field",
+    [("postgres", "schema"), ("trino", "schema"), ("mysql", "database"), ("clickhouse", "database")],
+)
+def test_specs_declare_which_profile_key_holds_the_namespace(db_type, namespace_field):
+    """The namespace key is spec data because it differs from the SQL concept.
+
+    MySQL and ClickHouse call their schema level a "database"; assuming `schema` everywhere made
+    step 2 of the precedence silently unreachable for both.
+    """
+    from schemapilot.engines import get_spec
+
+    assert get_spec(db_type).introspection_namespace_field == namespace_field
+
+
+def test_sqlite_declares_no_namespace_field():
+    """SQLite has 1-part names, so there is no namespace to scope to."""
+    from schemapilot.engines import get_spec
+
+    assert get_spec("sqlite").introspection_namespace_field is None
+
+
+def test_duckdb_uses_its_optional_schema_key():
+    """DuckDB connects by path but may still carry a `db.schema` composite to scope to."""
+    from schemapilot.engines import get_spec
+
+    assert get_spec("duckdb").introspection_namespace_field == "schema"
+
+
+@pytest.mark.parametrize("db_type", ["mysql", "clickhouse"])
+def test_configured_database_wins_over_enumeration(isolated_config, monkeypatch, db_type):
+    """For MySQL/ClickHouse the profile's `database` is the namespace and must beat enumeration.
+
+    Regression: `_resolve_schemas` looked only at `config["schema"]`, which these engines never
+    collect, so both enumerated every accessible database. Verified live on ClickHouse, whose
+    enumeration returns `default` alongside the configured database.
+    """
+    manager = DatabaseManager()
+    manager.add_connection("target", {
+        "name": "target",
+        "db_type": db_type,
+        "host": "127.0.0.1",
+        "username": "u",
+        "password": "p",
+        "database": "schemapilot_db",
+    })
+    manager.active_id = "target"
+
+    spec = manager.active_spec
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("enumeration must not run when the profile names a namespace")
+
+    monkeypatch.setattr(manager, "_enumerate_schemas", fail_if_called)
+
+    assert manager._resolve_schemas(None, spec, manager.active_config, None) == ["schemapilot_db"]
+    # An explicit argument still outranks the profile.
+    assert manager._resolve_schemas(None, spec, manager.active_config, ["other"]) == ["other"]
+
+
+def test_postgres_schema_key_still_wins_over_its_database_key(isolated_config, monkeypatch):
+    """Postgres collects both keys; only `schema` is the namespace."""
+    manager = DatabaseManager()
+    manager.add_connection("pg", {
+        "name": "pg",
+        "db_type": "postgres",
+        "host": "127.0.0.1",
+        "database": "analytics",
+        "schema": "reporting",
+    })
+    manager.active_id = "pg"
+
+    monkeypatch.setattr(
+        manager, "_enumerate_schemas",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not enumerate")),
+    )
+    assert manager._resolve_schemas(None, manager.active_spec, manager.active_config, None) == ["reporting"]
+
+
 # --------------------------------------------------------------------------- URIs and specs
 
 
@@ -359,6 +438,114 @@ def test_engine_is_disposed_on_switch(tmp_path, isolated_config):
 
     assert disposed, "the previous engine must be disposed when switching connections"
     assert manager.engine is not old_engine
+    manager._dispose_engine()
+
+
+def test_failed_switch_keeps_the_working_connection(tmp_path, isolated_config, monkeypatch):
+    """A failed switch must be a no-op, not a downgrade to a half-broken state.
+
+    The old ordering disposed the current engine before proving the candidate, so on failure
+    `active_id`/`active_spec` still named the old profile while `engine`/`langchain_db` were
+    None -- the REPL advertised an active connection that could not execute anything.
+    """
+    good = tmp_path / "good.db"
+    engine = create_engine(f"sqlite:///{good}")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY)"))
+        conn.commit()
+    engine.dispose()
+
+    manager = DatabaseManager()
+    manager.add_connection("good", {"name": "good", "db_type": "sqlite", "path": str(good)})
+    manager.add_connection("broken", {
+        "name": "broken", "db_type": "postgres", "host": "127.0.0.1", "port": 1, "database": "nope",
+    })
+    manager.select_connection("good")
+
+    working_engine = manager.engine
+    working_langchain_db = manager.langchain_db
+
+    monkeypatch.setattr(
+        manager, "_probe",
+        lambda engine, spec: (_ for _ in ()).throw(RuntimeError("connection refused")),
+    )
+
+    with pytest.raises(ConnectionError):
+        manager.select_connection("broken")
+
+    # State is unchanged and self-consistent: all five pieces still describe `good`.
+    assert manager.active_id == "good"
+    assert manager.active_spec.name == "sqlite"
+    assert manager.active_config["name"] == "good"
+    assert manager.engine is working_engine
+    assert manager.langchain_db is working_langchain_db
+    # And it is genuinely still usable, not merely non-None.
+    assert manager.execute_query("SELECT 1 AS one")["rows"] == [{"one": 1}]
+    manager._dispose_engine()
+
+
+def test_failed_switch_disposes_only_the_candidate(tmp_path, isolated_config, monkeypatch):
+    """The rejected candidate's pool must not leak, and the live engine must survive."""
+    good = tmp_path / "good.db"
+    engine = create_engine(f"sqlite:///{good}")
+    engine.connect().close()
+    engine.dispose()
+
+    manager = DatabaseManager()
+    manager.add_connection("good", {"name": "good", "db_type": "sqlite", "path": str(good)})
+    manager.add_connection("bad", {"name": "bad", "db_type": "sqlite", "path": str(tmp_path / "bad.db")})
+    manager.select_connection("good")
+
+    live_engine = manager.engine
+    live_disposed = []
+    live_engine.dispose = lambda *a, **k: live_disposed.append(True)
+
+    candidates = []
+    real_create_engine = db_module.create_engine
+
+    def tracking(*args, **kwargs):
+        created = real_create_engine(*args, **kwargs)
+        candidates.append(created)
+        disposed = []
+        created.dispose = lambda *a, **k: disposed.append(True)
+        created._disposed_calls = disposed
+        return created
+
+    monkeypatch.setattr(db_module, "create_engine", tracking)
+    monkeypatch.setattr(
+        manager, "_probe", lambda engine, spec: (_ for _ in ()).throw(RuntimeError("nope"))
+    )
+
+    with pytest.raises(ConnectionError):
+        manager.select_connection("bad")
+
+    assert len(candidates) == 1
+    assert candidates[0]._disposed_calls, "the rejected candidate engine must be disposed"
+    assert not live_disposed, "the working engine must NOT be disposed by a failed switch"
+
+
+def test_failed_switch_does_not_repersist_the_active_flag(tmp_path, isolated_config, monkeypatch):
+    """A failed switch must not rewrite connections.json to point at the broken profile."""
+    good = tmp_path / "good.db"
+    engine = create_engine(f"sqlite:///{good}")
+    engine.connect().close()
+    engine.dispose()
+
+    manager = DatabaseManager()
+    manager.add_connection("good", {"name": "good", "db_type": "sqlite", "path": str(good)})
+    manager.add_connection("bad", {"name": "bad", "db_type": "sqlite", "path": str(tmp_path / "bad.db")})
+    manager.select_connection("good")
+
+    monkeypatch.setattr(
+        manager, "_probe", lambda engine, spec: (_ for _ in ()).throw(RuntimeError("nope"))
+    )
+    with pytest.raises(ConnectionError):
+        manager.select_connection("bad")
+
+    with open(db_module.CONNECTIONS_FILE) as f:
+        persisted = json.load(f)
+    assert persisted["good"]["is_active"] is True
+    assert persisted["bad"].get("is_active") is not True
     manager._dispose_engine()
 
 
