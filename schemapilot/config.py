@@ -27,6 +27,12 @@ class Settings(BaseModel):
     LLM_BASE_URL: str = Field(default_factory=lambda: os.getenv("LLM_BASE_URL", ""))
     TEMPERATURE: float = 0.0
     
+    # Catalog / Prompt Budgets
+    # CATALOG_MAX_TABLES caps how many tables introspection reflects (wide warehouses can hold
+    # thousands); MAX_PROMPT_TABLES caps how many of them reach the LLM prompt.
+    CATALOG_MAX_TABLES: int = Field(default_factory=lambda: int(os.getenv("CATALOG_MAX_TABLES", "60")))
+    MAX_PROMPT_TABLES: int = Field(default_factory=lambda: int(os.getenv("MAX_PROMPT_TABLES", "12")))
+    
     # Security Settings
     ALLOW_MUTATING_QUERIES: bool = Field(default_factory=lambda: os.getenv("ALLOW_MUTATING_QUERIES", "false").lower() == "true")
     MAX_QUERY_LIMIT: int = 1000

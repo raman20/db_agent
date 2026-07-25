@@ -20,7 +20,9 @@ class ModelProfileManager:
 
     def load_profiles(self):
         """Loads saved profiles from models.json."""
-        os.makedirs(os.path.dirname(MODELS_FILE), exist_ok=True)
+        from schemapilot.db import ensure_config_dir
+
+        ensure_config_dir(os.path.dirname(MODELS_FILE))
         if os.path.exists(MODELS_FILE):
             try:
                 with open(MODELS_FILE, "r") as f:
@@ -37,10 +39,15 @@ class ModelProfileManager:
             self.profiles = {}
 
     def save_profiles(self):
-        """Saves LLM profiles to models.json."""
+        """Saves LLM profiles to models.json.
+
+        models.json holds plaintext LLM API keys, so it is written atomically with 0600 rather
+        than inheriting the process umask (which typically yields world-readable 0644).
+        """
+        from schemapilot.db import write_credential_json
+
         try:
-            with open(MODELS_FILE, "w") as f:
-                json.dump(self.profiles, f, indent=4)
+            write_credential_json(MODELS_FILE, self.profiles)
         except Exception as e:
             logger.error(f"Failed to save models file: {e}")
 

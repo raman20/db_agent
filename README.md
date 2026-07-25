@@ -124,6 +124,22 @@ options:
 
 ---
 
+## Credential Storage
+
+Connection profiles live in `~/.config/schemapilot/connections.json` and model profiles in
+`~/.config/schemapilot/models.json`. **Both store secrets in plaintext at rest** — database
+passwords and LLM API keys respectively.
+
+SchemaPilot mitigates this as far as file permissions allow: the directory is created `0700`
+and both files are written atomically with mode `0600`, so they are readable only by your user
+account. That is *not* encryption — anything running as your user can read them, and so can
+anyone with your backups. Prefer least-privilege, read-only database credentials.
+
+Storing secrets in the OS keyring (Keychain / Secret Service / Credential Manager) is planned
+future work.
+
+---
+
 ## Development & Testing
 
 Run the security sentinel test suite:

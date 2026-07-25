@@ -12,7 +12,22 @@ from schemapilot.config import settings
 
 from schemapilot.db import get_db
 from schemapilot.agent import SchemaPilotAgent
+from schemapilot.engines import engine_names, get_spec
 from schemapilot.llm import get_model_manager
+
+# Prompt text per connection field; the set of fields asked for comes from the engine spec.
+FIELD_PROMPTS = {
+    "host": "Enter database host (default: localhost): ",
+    "port": "Enter port (blank for the engine default): ",
+    "username": "Enter database username: ",
+    "password": "Enter database password: ",
+    "database": "Enter target database name: ",
+    "catalog": "Enter Trino catalog (e.g. tpch): ",
+    "schema": "Enter default schema (optional): ",
+    "path": "Enter database file path: ",
+    "http_scheme": "Enter HTTP scheme, http or https (blank to auto-detect): ",
+    "verify": "Enter TLS verification: true, false, or a CA bundle path (optional): ",
+}
 
 # SOTA Terminal visual imports
 from rich.console import Console
@@ -193,22 +208,25 @@ class SchemaPilotCLI:
             print("❌ Connection name is required.")
             return
 
-        db_type = input("Enter database dialect (postgres, mysql, sqlite): ").strip().lower()
-        if db_type not in ["postgres", "mysql", "sqlite"]:
-            print("❌ Invalid dialect. Only postgres, mysql, and sqlite are supported.")
+        db_type = input(f"Enter database dialect ({', '.join(engine_names())}): ").strip().lower()
+        try:
+            spec = get_spec(db_type)
+        except ValueError as e:
+            print(f"❌ {e}")
             return
 
-        config = {"name": name, "db_type": db_type}
-        
-        if db_type != "sqlite":
-            config["host"] = input("Enter database host (default: localhost): ").strip() or "localhost"
-            port_input = input(f"Enter port (default: {'5432' if db_type == 'postgres' else '3306'}): ").strip()
-            config["port"] = int(port_input) if port_input else (5432 if db_type == "postgres" else 3306)
-            config["username"] = input("Enter database username: ").strip()
-            config["password"] = input("Enter database password: ").strip()
-            config["database"] = input("Enter target database name: ").strip()
-        else:
-            config["database"] = input("Enter SQLite database file path: ").strip()
+        config = {"name": name, "db_type": spec.name}
+
+        # Prompt for exactly the fields the spec declares. Never inferred from sql_name_parts:
+        # DuckDB has 3-part SQL names but connects via a file path.
+        for field in spec.connection_fields:
+            value = input(FIELD_PROMPTS.get(field, f"Enter {field}: ")).strip()
+            if field == "port":
+                config["port"] = int(value) if value else spec.default_port
+            elif field == "host":
+                config["host"] = value or "localhost"
+            elif value:
+                config[field] = value
 
         self.console.print("\n⏳ Testing connection parameters...")
         success, message = self.db.test_connection(config)
@@ -238,19 +256,23 @@ class SchemaPilotCLI:
         
         for conn in conns:
             status = "[bold green]ACTIVE[/bold green]" if conn["is_active"] else ""
-            host_str = f"{conn['host']}:{conn['port']} / {conn['database']}" if conn["db_type"] != "sqlite" else conn["database"]
-            table.add_row(status, conn["id"], conn["name"], conn["db_type"].upper(), host_str)
+            # File-backed engines describe themselves with a path; server engines with host/port.
+            if conn.get("path"):
+                target = conn["path"]
+            elif conn.get("host"):
+                target = f"{conn['host']}:{conn['port']} / {conn.get('catalog') or conn.get('database') or ''}"
+            else:
+                target = conn.get("database") or ""
+            table.add_row(status, conn["id"], conn["name"], str(conn["db_type"] or "?").upper(), target)
             
         self.console.print(table)
 
     def select_connection(self, conn_id):
         """Activates target connection profile."""
         try:
+            # select_connection now persists the active flag itself.
             success = self.db.select_connection(conn_id)
             if success:
-                for cid in self.db.connections:
-                    self.db.connections[cid]["is_active"] = (cid == conn_id)
-                self.db.save_connections()
                 self.console.print(f"[bold green]✅ Switched active database connection profile to: {conn_id}[/bold green]")
             else:
                 self.console.print(f"[bold red]❌ Connection profile ID '{conn_id}' not found.[/bold red]", style="red")
