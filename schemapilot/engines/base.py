@@ -75,8 +75,16 @@ class EngineSpec:
     #: engine. NOTE: ``EXPLAIN`` is deliberately absent everywhere -- see security.py.
     readonly_commands: FrozenSet[str] = frozenset()
 
-    #: sqlglot expression class names that are read-only on this engine (``Show``, ``Pragma``...).
-    readonly_nodes: FrozenSet[str] = frozenset({"Show", "Pragma", "Describe"})
+    #: sqlglot expression class names that are read-only on this engine (``Show``, ``Describe``).
+    #: ``Pragma`` is deliberately NOT allowed here: a class-wide allowance let writable pragmas
+    #: such as ``PRAGMA user_version = 4242`` and ``PRAGMA writable_schema = ON`` through. Pragmas
+    #: are gated by name via ``readonly_pragmas`` instead.
+    readonly_nodes: FrozenSet[str] = frozenset({"Show", "Describe"})
+
+    #: Names of pragmas that only *read* state on this engine, ALWAYS lowercase. Only the bare
+    #: ``PRAGMA <name>`` form is ever allowed -- see ``security.py`` for why the argument form
+    #: (``PRAGMA table_info(t)``) cannot be told apart from an assignment.
+    readonly_pragmas: FrozenSet[str] = frozenset()
 
     #: Function names to block. ALWAYS stored lowercase -- comparison is against
     #: ``node.name.lower()``, so a camelCase entry would never match.

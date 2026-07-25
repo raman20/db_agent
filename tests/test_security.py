@@ -203,10 +203,10 @@ def test_pragma_per_engine():
     assert isinstance(sqlglot.parse_one("PRAGMA database_list", read="duckdb"), exp.Pragma)
     safe, _ = validate_sql_query("PRAGMA database_list", engine="duckdb")
     assert safe
-    # MySQL has no PRAGMA, so it is not in its readonly_nodes.
+    # MySQL has no PRAGMA at all, so its readonly_pragmas set is empty.
     safe, msg = validate_sql_query("PRAGMA database_list", engine="mysql")
     assert not safe
-    assert "allowlist" in msg
+    assert "read-only pragma" in msg
 
 
 def test_duckdb_and_trino_readonly_metadata_statements():
@@ -323,11 +323,16 @@ def test_legacy_dialect_fallback_without_engine():
     assert not safe
 
 
-def test_unknown_engine_name_degrades_instead_of_raising():
-    safe, _ = validate_sql_query("SELECT 1", engine="oracle")
+def test_unknown_engine_name_is_refused_not_downgraded():
+    """An explicit engine we do not know must not silently receive MySQL policy."""
+    for bad in ("oracle", "postgress"):
+        safe, msg = validate_sql_query("SELECT 1", engine=bad)
+        assert not safe, bad
+        assert "Unsupported engine" in msg
+        assert bad in msg
+    # Registry aliases still resolve.
+    safe, _ = validate_sql_query("SELECT 1", engine="postgresql")
     assert safe
-    safe, _ = validate_sql_query("DROP TABLE t", engine="oracle")
-    assert not safe
 
 
 def test_empty_and_unparseable_input():
@@ -351,3 +356,148 @@ def test_no_engine_allows_explain_nowhere():
 
     for spec in ENGINES.values():
         assert "EXPLAIN" not in spec.readonly_commands, spec.name
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: four empirically reproduced bypasses.
+# ---------------------------------------------------------------------------
+
+
+def test_admin_statements_sharing_the_table_t_shape_are_blocked():
+    """`TABLE t` has no sqlglot node; it lands in the same Alias shape as these do.
+
+    Allowing the `Alias` class wholesale therefore allowed destructive admin statements --
+    `RESET MASTER` deletes MySQL binary logs with privileged credentials.
+    """
+    for sql, dialect in [
+        ("RESET MASTER", "mysql"),
+        ("FLUSH TABLES", "mysql"),
+        ("REINDEX idx_name", "sqlite"),
+        ("CLUSTER users", "postgres"),
+    ]:
+        parsed = sqlglot.parse_one(sql, read=dialect)
+        assert isinstance(parsed, exp.Alias), sql  # the shape that made this a bypass
+        assert isinstance(sqlglot.parse_one("TABLE t", read=dialect), exp.Alias)
+
+        engine = {"mysql": "mysql", "sqlite": "sqlite", "postgres": "postgres"}[dialect]
+        safe, msg = validate_sql_query(sql, engine=engine)
+        assert not safe, sql
+        assert "blocked by default" in msg, sql
+        # Not unlockable by read-write mode either.
+        safe, _ = validate_sql_query(sql, engine=engine, allow_mutation=True)
+        assert not safe, sql
+
+
+def test_bare_table_statement_still_allowed():
+    """The narrow shape the Alias allowance existed for must keep working."""
+    for engine in ("mysql", "postgres", "trino", "duckdb"):
+        safe, msg = validate_sql_query("TABLE orders", engine=engine)
+        assert safe, f"{engine}: {msg}"
+
+
+def test_select_into_is_blocked_as_ddl():
+    """Postgres runs `SELECT ... INTO t` as CREATE TABLE AS, and execute_query() commits it."""
+    parsed = sqlglot.parse_one("SELECT * INTO new_table FROM users", read="postgres")
+    assert isinstance(parsed, exp.Select)  # an allowed root...
+    assert isinstance(parsed.args.get("into"), exp.Into)  # ...with a DDL child
+
+    for kwargs in ({}, {"allow_mutation": True}):
+        safe, msg = validate_sql_query("SELECT * INTO new_table FROM users", engine="postgres", **kwargs)
+        assert not safe, kwargs
+        assert "INTO" in msg
+
+
+def test_select_into_blocked_when_nested():
+    for sql in (
+        "SELECT 1 UNION SELECT * INTO t FROM u",
+        "WITH a AS (SELECT * INTO z FROM u) SELECT 1",
+        "SELECT * INTO TEMPORARY tt FROM users",
+    ):
+        safe, msg = validate_sql_query(sql, engine="postgres", allow_mutation=True)
+        assert not safe, sql
+        assert "INTO" in msg
+
+
+def test_locking_reads_are_blocked():
+    """Another side-effect-bearing child of an allowed Select root: it takes row locks."""
+    parsed = sqlglot.parse_one("SELECT * FROM t FOR UPDATE", read="postgres")
+    assert isinstance(parsed, exp.Select)
+    safe, msg = validate_sql_query("SELECT * FROM t FOR UPDATE", engine="postgres")
+    assert not safe
+    assert "LOCK" in msg
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["PRAGMA user_version = 4242", "PRAGMA journal_mode = WAL", "PRAGMA writable_schema = ON"],
+)
+def test_writable_pragmas_blocked(sql):
+    """A class-wide Pragma allowance let these persist state from a read-only session."""
+    assert isinstance(sqlglot.parse_one(sql, read="sqlite"), exp.Pragma)
+    for kwargs in ({}, {"allow_mutation": True}):
+        safe, msg = validate_sql_query(sql, engine="sqlite", **kwargs)
+        assert not safe, (sql, kwargs)
+        assert "PRAGMA <name>" in msg
+
+
+def test_pragma_assignment_blocked_on_duckdb_too():
+    safe, msg = validate_sql_query("PRAGMA user_version = 4242", engine="duckdb")
+    assert not safe
+    assert "PRAGMA <name>" in msg
+    # DuckDB parses the argument form as Anonymous rather than EQ; both fail closed.
+    safe, _ = validate_sql_query("PRAGMA storage_info(t)", engine="duckdb")
+    assert not safe
+
+
+def test_unknown_pragma_name_fails_closed():
+    safe, msg = validate_sql_query("PRAGMA some_future_pragma", engine="sqlite")
+    assert not safe
+    assert "read-only pragma" in msg
+
+
+def test_readonly_pragmas_still_allowed():
+    for engine, name in [("sqlite", "database_list"), ("duckdb", "database_list"), ("duckdb", "show_tables")]:
+        safe, msg = validate_sql_query(f"PRAGMA {name}", engine=engine)
+        assert safe, f"{engine} {name}: {msg}"
+
+
+def test_argument_pragmas_fail_closed_on_sqlite():
+    """sqlglot parses `PRAGMA table_info(t)` into the same EQ node as an assignment.
+
+    So the read form is indistinguishable from a write and must be refused; this asserts the
+    cost of that decision is understood rather than accidental.
+    """
+    parsed = sqlglot.parse_one("PRAGMA table_info(t)", read="sqlite")
+    assert isinstance(parsed.this, exp.EQ)
+    safe, _ = validate_sql_query("PRAGMA table_info(t)", engine="sqlite")
+    assert not safe
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT pg_read_file('/etc/passwd')",
+        "SELECT pg_write_file('/tmp/x', 'y')",
+        "SELECT pg_ls_dir('/etc')",
+    ],
+)
+def test_legacy_path_keeps_the_global_dangerous_function_floor(sql):
+    """Making the policy per-engine must not make any call LESS strict than before.
+
+    These were caught by the pre-rewrite global function denylist; with no `engine=` the call
+    lands on the MySQL spec, whose own set does not list them.
+    """
+    safe, msg = validate_sql_query(sql)
+    assert not safe, sql
+    assert "blocked system function" in msg
+
+
+def test_global_dangerous_function_floor_applies_to_every_engine():
+    from schemapilot.engines.registry import ENGINES
+
+    for name in ENGINES:
+        safe, msg = validate_sql_query("SELECT pg_read_file('/etc/passwd')", engine=name)
+        assert not safe, name
+        assert "blocked system function" in msg
+        safe, _ = validate_sql_query("SELECT load_file('/etc/passwd')", engine=name)
+        assert not safe, name

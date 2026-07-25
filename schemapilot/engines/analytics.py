@@ -44,6 +44,9 @@ DUCKDB = EngineSpec(
     quote_char='"',
     has_information_schema=True,
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC"}),
+    # DuckDB pragmas are also a mixed namespace (`PRAGMA enable_external_access`, `PRAGMA
+    # temp_directory='...'` are settings, not queries), so only the bare introspection ones.
+    readonly_pragmas=frozenset({"database_list", "show_tables", "database_size", "version", "platform"}),
     system_schemas=frozenset({"system", "temp", "information_schema", "pg_catalog"}),
     schema_name_style="composite",
     # --add-conn only asks DuckDB for a path, but a profile may still carry an explicit `schema`

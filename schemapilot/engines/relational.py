@@ -38,10 +38,8 @@ MYSQL = EngineSpec(
     connection_fields=("host", "port", "username", "password", "database"),
     quote_char="`",
     readonly_commands=frozenset({"SHOW", "DESCRIBE", "DESC"}),
-    # No "Pragma": MySQL has no PRAGMA statement, so `PRAGMA ...` here is either nonsense or an
-    # attempt to smuggle SQLite/DuckDB syntax past the sentry. Overridden rather than removed
-    # from the default because SQLite and DuckDB do support it.
-    readonly_nodes=frozenset({"Show", "Describe"}),
+    # readonly_pragmas stays empty: MySQL has no PRAGMA statement, so `PRAGMA ...` here is
+    # either nonsense or an attempt to smuggle SQLite/DuckDB syntax past the sentry.
     system_schemas=frozenset({"information_schema", "mysql", "performance_schema", "sys"}),
     # MySQL's schema level IS its database, and that is the key --add-conn collects.
     introspection_namespace_field="database",
@@ -64,7 +62,11 @@ SQLITE = EngineSpec(
     quote_char='"',
     has_information_schema=False,
     readonly_commands=frozenset(),
-    readonly_nodes=frozenset({"Show", "Pragma", "Describe"}),
+    # SQLite's pragma namespace mixes introspection with persistent, destructive settings
+    # (`user_version`, `journal_mode`, `writable_schema`), and sqlglot parses the read form
+    # `PRAGMA table_info(t)` into the SAME `EQ` node as the write form `PRAGMA x = y` -- so only
+    # these no-argument introspection pragmas are allowed, and only in their bare form.
+    readonly_pragmas=frozenset({"database_list", "collation_list", "compile_options", "function_list", "module_list"}),
     dangerous_functions=frozenset({"load_extension", "readfile", "writefile", "edit", "fsdir"}),
     dangerous_nodes=frozenset({"Attach", "Detach"}),
     _build_uri=_sqlite_uri,

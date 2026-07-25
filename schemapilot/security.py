@@ -16,6 +16,20 @@ Why classify the top level *first* instead of only walking? Because ``exp.Comman
 state-mutating ``SYSTEM``/``OPTIMIZE`` -- they are the *same node type* -- which is exactly why
 the old code had to blanket-block ``exp.Command`` and thereby rejected ``SHOW TABLES``.
 
+Two corollaries of "fail closed" that are easy to get wrong, both of which were real bypasses:
+
+* **Never allow a node *class* as a proxy for a statement shape.** ``TABLE t`` has no node of its
+  own -- sqlglot mis-parses it as ``Alias`` -- and so do ``RESET MASTER``, ``FLUSH TABLES``,
+  ``REINDEX i`` and ``CLUSTER users``. Allowing ``exp.Alias`` allowed all of them. Likewise a
+  class-wide ``exp.Pragma`` allowance allowed ``PRAGMA writable_schema = ON``.
+* **An allowed root can carry a mutating child.** ``SELECT * INTO t FROM u`` is an ``exp.Select``
+  holding an ``exp.Into``, and Postgres executes it as ``CREATE TABLE ... AS`` -- so
+  side-effect-bearing children are enumerated in ``ALWAYS_BLOCKED_CHILDREN``, not assumed absent.
+
+Making the policy per-engine must never make a call *less* strict than the pre-registry sentry:
+``GLOBAL_DANGEROUS_FUNCTIONS`` is a floor unioned into every engine's set, and an explicitly named
+engine we do not recognise is refused rather than quietly downgraded to the default policy.
+
 **Stated limit: this is a DDL/DML guard, not a sandbox.** Read-shaped SQL can still reach the
 filesystem or network through engine table functions; ``dangerous_functions`` raises the bar,
 but least-privilege database credentials are the real control.
@@ -76,20 +90,61 @@ ALWAYS_BLOCKED = (
 #: are siblings of ``Union``, not subclasses in a way isinstance would cover usefully, and are
 #: verified real top-level nodes for legitimate queries (``SELECT 1 INTERSECT SELECT 2``,
 #: ``VALUES (1),(2)``) -- a set of only {Select, Union} default-denies valid read-only SQL.
-#: ``Alias``/``Subquery`` cover ``TABLE t`` and ``(SELECT 1)``, which parse to those nodes.
+#:
+#: ``exp.Alias`` is deliberately NOT here. It was, to support ``TABLE t``, and that blanket class
+#: allowance was a real bypass: sqlglot parses ``RESET MASTER``, ``FLUSH TABLES``, ``REINDEX i``
+#: and ``CLUSTER users`` into the *identical* ``Alias(Column(Identifier(KEYWORD)), alias=...)``
+#: shape as ``TABLE t``, so allowing the class allowed all four. ``TABLE t`` is now recognised by
+#: shape in ``_is_bare_table_statement``.
 READONLY_NODES = (
     exp.Select,
     exp.Union,
     exp.Intersect,
     exp.Except,
     exp.Values,
-    exp.Alias,
     exp.Subquery,
 )
 
+#: Side-effect-bearing *children* of an otherwise read-only root. The class of bug: an allowed
+#: top-level ``Select`` with a mutating child that the statement-level check never enumerates.
+#: ``SELECT * INTO new_table FROM users`` is an allowed ``exp.Select`` carrying an ``exp.Into``,
+#: and Postgres executes it as ``CREATE TABLE ... AS``. Same reasoning for locking reads and
+#: engine-specific data movement, none of which belong in a generated answer.
+ALWAYS_BLOCKED_CHILDREN = (
+    exp.Into,
+    exp.Lock,
+    exp.LockingStatement,
+    exp.Put,
+    exp.LoadData,
+)
+
+#: Statement nodes that are blocked in every mode but only ever appear as a whole statement.
+_BLOCKED_STATEMENTS = ALWAYS_BLOCKED + ALWAYS_BLOCKED_CHILDREN
+
 #: Nodes whose *statement* meaning must be re-checked wherever they appear, not just at the top
 #: level -- e.g. an INSERT hidden behind a CTE, or a DROP as the second half of a Block.
-_STATEMENT_NODES = (exp.Command,) + ALWAYS_BLOCKED + PERMITTED_MUTATIONS
+_STATEMENT_NODES = (exp.Command, exp.Pragma) + _BLOCKED_STATEMENTS + PERMITTED_MUTATIONS
+
+#: A floor that applies on EVERY path, per-engine set or not. The pre-rewrite sentry had one
+#: global function denylist; making the policy per-engine must not make any single call *less*
+#: strict than it used to be, so the old union is retained and unioned in everywhere. Lowercase,
+#: because the comparison is against ``node.name.lower()``.
+GLOBAL_DANGEROUS_FUNCTIONS = frozenset(
+    {
+        "load_file",
+        "system",
+        "cmd_exec",
+        "sys_exec",
+        "sys_eval",
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_write_file",
+        "pg_ls_dir",
+        "lo_import",
+        "lo_export",
+        "copy",
+    }
+)
 
 #: The pre-registry dialect mapping, kept verbatim so ``validate_sql_query`` behaves exactly as
 #: before when no ``engine`` is supplied. This is the ONLY per-engine literal left in this
@@ -103,26 +158,30 @@ _LEGACY_DEFAULT_ENGINE = "mysql"
 
 
 def _resolve_spec(engine: Optional[str], dialect: str) -> EngineSpec:
-    """Pick the policy source: the named engine's spec, else the legacy dialect mapping."""
-    for candidate in (engine, _LEGACY_DIALECT_ENGINES.get((dialect or "").strip().lower())):
-        if not candidate:
-            continue
-        try:
-            return get_spec(candidate)
-        except ValueError:
-            # An unknown engine name must not raise out of a validator whose contract is
-            # (ok, message); degrade to the legacy default instead.
-            continue
-    return get_spec(_LEGACY_DEFAULT_ENGINE)
+    """Pick the policy source: the named engine's spec, else the legacy dialect mapping.
+
+    Raises:
+        ValueError: if ``engine`` is given but unknown. Silently degrading a typo such as
+            ``engine="postgress"`` to the default meant a caller who *asked* for Postgres policy
+            got MySQL policy instead -- a fail-open on a misconfiguration. Only the legacy
+            ``dialect`` argument, whose contract has always been "unknown means mysql", falls back.
+    """
+    if engine and str(engine).strip():
+        return get_spec(engine)
+    legacy = _LEGACY_DIALECT_ENGINES.get((dialect or "").strip().lower())
+    return get_spec(legacy or _LEGACY_DEFAULT_ENGINE)
 
 
 def _dangerous_reason(node: exp.Expression, spec: EngineSpec) -> Optional[str]:
-    """Per-engine filesystem/network escape hatches, checked by node type AND by name.
+    """Filesystem/network escape hatches, checked by node type AND by name.
 
     Both checks are needed: verified that ``read_csv(...)`` parses to ``exp.ReadCSV`` and
     ``read_parquet(...)`` to ``exp.ReadParquet``, so a name-only check misses them, while
     ``read_csv_auto``, ``read_json``, ``glob``, ``s3`` and ``url`` parse to ``exp.Anonymous``,
     where only the name identifies them.
+
+    Names are the engine's set UNIONED with GLOBAL_DANGEROUS_FUNCTIONS, so no engine (and no
+    legacy call) can be laxer than the pre-rewrite global denylist.
     """
     node_name = type(node).__name__
     if node_name in spec.dangerous_nodes:
@@ -134,9 +193,57 @@ def _dangerous_reason(node: exp.Expression, spec: EngineSpec) -> Optional[str]:
         # Only unrecognised functions (Anonymous / AnonymousAggFunc) carry a name here; typed
         # nodes such as exp.Sum report name="" and are never in the (lowercase) blocklist.
         func_name = (node.name or "").lower()
-        if func_name and func_name in spec.dangerous_functions:
+        if func_name and func_name in (spec.dangerous_functions | GLOBAL_DANGEROUS_FUNCTIONS):
             return f"Security Violation: invocation of blocked system function '{func_name}'."
     return None
+
+
+def _is_bare_table_statement(node: exp.Expression) -> bool:
+    """Whether ``node`` is the read-only ``TABLE <name>`` form and nothing else.
+
+    sqlglot has no node for ``TABLE t``; it mis-parses it as ``Alias(Column('TABLE'), alias=t)``.
+    Every other ``KEYWORD identifier`` statement it cannot parse lands in that same shape --
+    ``RESET MASTER``, ``FLUSH TABLES``, ``REINDEX idx``, ``CLUSTER users`` -- so the leading
+    keyword must be checked explicitly. Anything else fails closed.
+    """
+    if not isinstance(node, exp.Alias):
+        return False
+    head = node.this
+    if not isinstance(head, exp.Column):
+        return False
+    # A bare `TABLE t`: no db/catalog qualification, no extra args, and an identifier alias.
+    if set(head.args) - {"this"}:
+        return False
+    if not isinstance(node.args.get("alias"), exp.Identifier):
+        return False
+    return str(head.name).strip().upper() == "TABLE"
+
+
+def _pragma_reason(node: exp.Pragma, spec: EngineSpec) -> Optional[str]:
+    """Allow only ``PRAGMA <name>`` where ``<name>`` is a declared read-only pragma.
+
+    A class-wide ``Pragma`` allowance let ``PRAGMA user_version = 4242``, ``PRAGMA journal_mode =
+    WAL`` and ``PRAGMA writable_schema = ON`` persist state from a read-only session. The
+    assignment form is rejected by shape: verified that sqlglot parses the *argument* form
+    ``PRAGMA table_info(t)`` into the same ``EQ`` node as an assignment on SQLite, so an ``EQ``
+    payload is indistinguishable from a write and must fail closed -- even though that costs us
+    the argument-taking introspection pragmas.
+    """
+    payload = node.this
+    if not isinstance(payload, (exp.Var, exp.Column, exp.Identifier)):
+        # EQ (assignment, and also SQLite's argument form), Anonymous (DuckDB's argument form),
+        # or anything new.
+        return (
+            f"Security Violation: only the bare 'PRAGMA <name>' form is allowed on "
+            f"{spec.display_name}; assignment and argument forms are blocked."
+        )
+    name = str(payload.name).strip().lower()
+    if name in spec.readonly_pragmas:
+        return None
+    return (
+        f"Security Violation: pragma '{name}' is not a known read-only pragma on "
+        f"{spec.display_name}."
+    )
 
 
 def _statement_reason(
@@ -175,7 +282,7 @@ def _statement_reason(
     if dangerous:
         return dangerous
 
-    if isinstance(node, ALWAYS_BLOCKED):
+    if isinstance(node, _BLOCKED_STATEMENTS):
         action = type(node).__name__.upper()
         return (
             f"Security Violation: operation '{action}' is blocked in every mode, including "
@@ -188,9 +295,14 @@ def _statement_reason(
         action = type(node).__name__.upper()
         return f"Security Violation: mutating operation '{action}' is disabled in the current session."
 
-    # Read-only: the shared shapes, plus whatever this engine declares (Show / Pragma /
-    # Describe are stored as class-name strings on the spec).
+    if isinstance(node, exp.Pragma):
+        return _pragma_reason(node, spec)
+
+    # Read-only: the shared shapes, the narrow `TABLE t` form, plus whatever this engine declares
+    # (Show / Describe are stored as class-name strings on the spec).
     if isinstance(node, READONLY_NODES) or type(node).__name__ in spec.readonly_nodes:
+        return None
+    if _is_bare_table_statement(node):
         return None
 
     # Default deny. A node type nobody has classified is a node type nobody has reasoned about,
@@ -215,7 +327,7 @@ def validate_sql_query(
         allow_mutation: unlocks INSERT/UPDATE/DELETE and nothing else.
         engine: an engine registry key (``postgres``, ``trino``, ``duckdb``, ...). When given,
             the whole policy -- parse dialect, read-only commands, dangerous functions -- comes
-            from that engine's spec.
+            from that engine's spec. An unrecognised name is refused, never downgraded.
 
     Returns:
         ``(is_safe, message)``. The message is user-facing and explains the refusal.
@@ -224,7 +336,13 @@ def validate_sql_query(
     if not cleaned_sql:
         return False, "Empty query string provided."
 
-    spec = _resolve_spec(engine, dialect)
+    try:
+        spec = _resolve_spec(engine, dialect)
+    except ValueError as e:
+        # An explicitly named engine we do not know is a refusal, not a downgrade: quietly
+        # applying MySQL policy to `engine="postgress"` would hand the caller weaker rules than
+        # the ones they asked for.
+        return False, f"Security Violation: {e}"
 
     try:
         expression = sqlglot.parse_one(cleaned_sql, read=spec.sqlglot_dialect)
