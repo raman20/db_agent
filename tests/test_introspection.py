@@ -17,51 +17,6 @@ from schemapilot import db as db_module
 from schemapilot.db import DatabaseManager
 
 
-# --------------------------------------------------------------------------- fixtures
-
-
-@pytest.fixture
-def isolated_config(tmp_path, monkeypatch):
-    """Points both credential stores at a throwaway HOME."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-
-    config_dir = home / ".config" / "schemapilot"
-
-    # schemapilot.paths owns the directory; db/llm own their own filenames. Patching paths is
-    # what actually redirects ensure_config_dir()'s default.
-    from schemapilot import llm as llm_module
-    from schemapilot import paths as paths_module
-
-    monkeypatch.setattr(paths_module, "USER_CONFIG_DIR", str(config_dir))
-    monkeypatch.setattr(db_module, "USER_CONFIG_DIR", str(config_dir))
-    monkeypatch.setattr(db_module, "CONNECTIONS_FILE", str(config_dir / "connections.json"))
-    monkeypatch.setattr(llm_module, "USER_CONFIG_DIR", str(config_dir))
-    monkeypatch.setattr(llm_module, "MODELS_FILE", str(config_dir / "models.json"))
-    return config_dir
-
-
-@pytest.fixture
-def sqlite_db(tmp_path, isolated_config):
-    """A SQLite database with a primary key and a foreign key, wired as the active connection."""
-    path = tmp_path / "pilot.db"
-    engine = create_engine(f"sqlite:///{path}")
-    with engine.connect() as conn:
-        conn.execute(text("CREATE TABLE parent (pid INTEGER PRIMARY KEY, nm TEXT NOT NULL)"))
-        conn.execute(
-            text("CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(pid))")
-        )
-        conn.commit()
-    engine.dispose()
-
-    manager = DatabaseManager()
-    manager.add_connection("sqlite-fx", {"name": "fx", "db_type": "sqlite", "path": str(path)})
-    manager.select_connection("sqlite-fx")
-    yield manager
-    manager._dispose_engine()
-
-
 @pytest.fixture
 def duckdb_db(tmp_path, isolated_config):
     """A file-backed DuckDB with two user schemas (`main` and `other`)."""

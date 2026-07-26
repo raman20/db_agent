@@ -43,37 +43,6 @@ from schemapilot.repl.session import (
 # --------------------------------------------------------------------------- fixtures
 
 
-@pytest.fixture
-def isolated_config(tmp_path, monkeypatch):
-    """Redirects the credential store into a throwaway HOME (profiles are persisted)."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    config_dir = home / ".config" / "schemapilot"
-    monkeypatch.setattr(db_module, "USER_CONFIG_DIR", str(config_dir))
-    monkeypatch.setattr(db_module, "CONNECTIONS_FILE", str(config_dir / "connections.json"))
-    return config_dir
-
-
-def _seed_sqlite(path) -> str:
-    """A two-table SQLite database with a real PK and a real FK."""
-    engine = create_engine(f"sqlite:///{path}")
-    with engine.connect() as conn:
-        conn.execute(text("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"))
-        conn.execute(
-            text(
-                "CREATE TABLE orders ("
-                "  id INTEGER PRIMARY KEY,"
-                "  customer_id INTEGER REFERENCES customers(id),"
-                "  amount NUMERIC"
-                ")"
-            )
-        )
-        conn.commit()
-    engine.dispose()
-    return str(path)
-
-
 class _StubModelManager:
     """Stands in for ModelProfileManager so no models.json or API key is involved."""
 
@@ -85,9 +54,9 @@ class _StubModelManager:
 
 
 @pytest.fixture
-def session(tmp_path, isolated_config):
+def session(tmp_path, isolated_config, seeded_sqlite_path):
     """A ReplSession on a SQLite profile, rendering into a recordable console."""
-    primary = _seed_sqlite(tmp_path / "primary.db")
+    primary = seeded_sqlite_path
 
     manager = DatabaseManager()
     manager.add_connection("primary", {"name": "primary", "db_type": "sqlite", "path": primary})
@@ -639,6 +608,7 @@ def test_schema_selection_event_is_captured_into_last_selection(session, monkeyp
         "scores": {"orders": 0.5},
         "reasons": {"orders": "pinned with @"},
         "strategy": "pruned",
+        "pin_problems": [],
     }
     assert record["pinned_tables"] == ["orders"]
     # Stored, not printed.

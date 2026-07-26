@@ -348,6 +348,20 @@ def cmd_why(session, args: str):
     note = _STRATEGY_NOTES.get(selection.get("strategy") or "")
     if note:
         session.console.print(f"[dim]{escape(note)}[/dim]")
+    pin_problems = selection.get("pin_problems") or []
+    if pin_problems:
+        session.console.print("\n[yellow]The following pins could not be resolved:[/yellow]")
+        for pp in pin_problems:
+            pin, kind, candidates = pp.get("pin", ""), pp.get("kind", "unknown"), pp.get("candidates", [])
+            if kind == "ambiguous" and candidates:
+                session.console.print(
+                    f"  [bold]{escape(str(pin))}[/bold] matches more than one table "
+                    f"({escape(', '.join(candidates))}) -- try a qualified name."
+                )
+            else:
+                session.console.print(
+                    f"  [bold]{escape(str(pin))}[/bold] does not match any table in the catalog."
+                )
     if session.pinned_tables:
         session.console.print(f"[dim]Pinned for the next question: {', '.join(session.pinned_tables)}[/dim]")
 

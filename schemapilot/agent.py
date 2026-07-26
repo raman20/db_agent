@@ -417,6 +417,7 @@ class SchemaPilotAgent:
             "scores": selection["scores"],
             "reasons": selection.get("reasons", {}),
             "strategy": selection.get("strategy", ""),
+            "pin_problems": selection.get("pin_problems", []),
         }) + "\n"
 
         samples: Dict[str, Dict[str, Any]] = {}

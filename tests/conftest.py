@@ -163,6 +163,81 @@ SEED_STATEMENTS = (
 # --------------------------------------------------------------------------- config fixtures
 
 
+@pytest.fixture
+def seeded_sqlite_path(tmp_path):
+    """A file-backed SQLite file carrying the shared seed schema (customers + orders, PK + FK).
+
+    Replaces the ``_seed_sqlite`` helper that was copy-pasted between test modules; the fixture
+    is always torn down with ``tmp_path``, so no cleanup is needed.
+    """
+    import sqlite3
+
+    path = str(tmp_path / "seed.db")
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        for statement in SEED_STATEMENTS:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+@pytest.fixture
+def isolated_config(tmp_path, monkeypatch):
+    """Points every credential store at a throwaway HOME.
+
+    ``schemapilot.paths`` is the single source of truth for ``USER_CONFIG_DIR``;
+    ``db``/``llm`` still re-export module-level aliases for backwards-compatible
+    monkeypatching, and ``repl.session`` has now been switched (build-t5-repl) so
+    this fixture covers all four.
+    """
+    from schemapilot import db as db_module
+    from schemapilot import llm as llm_module
+    from schemapilot import paths as paths_module
+    from schemapilot import repl
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    config_dir = home / ".config" / "schemapilot"
+
+    monkeypatch.setattr(paths_module, "USER_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(db_module, "USER_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(db_module, "CONNECTIONS_FILE", str(config_dir / "connections.json"))
+    monkeypatch.setattr(llm_module, "USER_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(llm_module, "MODELS_FILE", str(config_dir / "models.json"))
+    monkeypatch.setattr(repl.session, "USER_CONFIG_DIR", str(config_dir))
+    return config_dir
+
+
+@pytest.fixture
+def sqlite_db(tmp_path, isolated_config):
+    """A SQLite database with a primary key and a foreign key, wired as the active connection."""
+    from sqlalchemy import create_engine, text
+    from schemapilot.db import DatabaseManager
+
+    path = tmp_path / "pilot.db"
+    engine = create_engine(f"sqlite:///{path}")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE parent (pid INTEGER PRIMARY KEY, nm TEXT NOT NULL)"))
+        conn.execute(
+            text("CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(pid))")
+        )
+        conn.commit()
+    engine.dispose()
+
+    manager = DatabaseManager()
+    manager.add_connection("sqlite-fx", {"name": "fx", "db_type": "sqlite", "path": str(path)})
+    manager.select_connection("sqlite-fx")
+    yield manager
+    manager._dispose_engine()
+
+
+# --------------------------------------------------------------------------- originals (session-scoped)
+
+
 @pytest.fixture(scope="session")
 def sqlite_seeded_path(tmp_path_factory) -> str:
     """A file-backed SQLite database carrying the shared seed schema (PK + real FK)."""

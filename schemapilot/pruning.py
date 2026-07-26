@@ -17,9 +17,10 @@ No LLM call, no embeddings, no new dependency -- ``difflib`` is in the standard 
 
 import difflib
 import re
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set
 
 from schemapilot.config import settings
+from schemapilot.names import match_table_names, normalise
 
 #: Words that carry no schema signal. Deliberately grammatical/interrogative only: nouns like
 #: "total", "count" or "amount" stay in, because they are extremely common *column* names and
@@ -130,32 +131,54 @@ def score_tables(question: str, catalog: Dict[str, Any]) -> Dict[str, float]:
     return scores
 
 
-def resolve_pinned(pinned: Optional[Iterable[str]], catalog: Dict[str, Any]) -> List[str]:
+class PinResolution(NamedTuple):
+    """The outcome of resolving ``@table`` pins.
+
+    ``tables`` are the catalog keys that resolved unambiguously. ``problems`` are the pins that
+    did not, each ``{"pin": str, "kind": "unknown"|"ambiguous", "candidates": [...]}`` -- kept
+    separate from the resolved list, rather than discarded, because a pin that vanishes without
+    explanation is indistinguishable from pruning simply not working.
+    """
+
+    tables: List[str]
+    problems: List[Dict[str, Any]]
+
+
+def resolve_pinned(pinned: Optional[Iterable[str]], catalog: Dict[str, Any]) -> PinResolution:
     """Map user-typed ``@table`` names onto real catalog keys.
 
-    The user types what completion offered or what they remember, which may be unqualified
-    (``orders``) or differently cased. Resolution order: exact key, case-insensitive key, then
-    a match on the unqualified table name. Unresolvable pins are dropped rather than passed
-    through, because a name that is not in the catalog cannot be rendered into the prompt.
+    Resolution is delegated to :mod:`schemapilot.names`, which the completer and
+    ``SchemaCache.resolve()`` also use, so the three layers cannot disagree about what ``@orders``
+    means. They used to: the completer matched on the leaf name, the cache returned the
+    alphabetically first match, and this function dropped ambiguous pins outright -- so on a
+    catalog holding both ``sales.orders`` and ``archive.orders``, one ``@orders`` produced three
+    different answers and the user was shown none of them.
+
+    **Ambiguity is reported, never guessed and never silently dropped.** Picking the
+    alphabetically first table is arbitrary and, with an ``archive`` schema present, reliably
+    picks the stale copy; dropping the pin throws away the strongest signal the user gave us.
+    Both become a ``problems`` entry naming the tables that collided, so the caller can ask the
+    user to qualify it.
     """
     tables = catalog.get("tables", {}) or {}
-    lowered = {key.lower(): key for key in tables}
-    by_leaf: Dict[str, List[str]] = {}
-    for key in tables:
-        by_leaf.setdefault(key.split(".")[-1].lower(), []).append(key)
+    keys = list(tables)
 
     resolved: List[str] = []
+    problems: List[Dict[str, Any]] = []
     for raw in pinned or []:
-        name = (raw or "").strip().lstrip("@")
-        if not name:
+        if not normalise(raw):
             continue
-        key = name if name in tables else lowered.get(name.lower())
-        if key is None:
-            candidates = by_leaf.get(name.lower().split(".")[-1], [])
-            key = candidates[0] if len(candidates) == 1 else None
-        if key and key not in resolved:
-            resolved.append(key)
-    return resolved
+        matches = match_table_names(raw, keys)
+        if len(matches) == 1:
+            if matches[0] not in resolved:
+                resolved.append(matches[0])
+        else:
+            problems.append({
+                "pin": str(raw).strip(),
+                "kind": "ambiguous" if matches else "unknown",
+                "candidates": matches,
+            })
+    return PinResolution(resolved, problems)
 
 
 def _adjacency(catalog: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -208,17 +231,23 @@ def select_relevant_tables(question: str, catalog: Dict[str, Any],
         pinned: table names the user pinned with ``@table``; always included.
 
     Returns:
-        ``{"tables": [...], "scores": {name: score}, "reasons": {name: why}, "strategy": str}``
-        -- the scores and reasons are what ``/why`` prints, so a bad selection is diagnosable.
+        ``{"tables": [...], "scores": {name: score}, "reasons": {name: why}, "strategy": str,
+        "pin_problems": [...]}`` -- the scores and reasons are what ``/why`` prints, so a bad
+        selection is diagnosable, and ``pin_problems`` names any pin that could not be resolved
+        (see :func:`resolve_pinned`) so an unresolvable pin is reported rather than vanishing.
     """
     tables = catalog.get("tables", {}) or {}
     cap = max(1, int(settings.MAX_PROMPT_TABLES))
     scores = score_tables(question, catalog)
 
     if not tables:
-        return {"tables": [], "scores": {}, "reasons": {}, "strategy": "empty-catalog"}
+        # An empty catalog makes every pin unknown, which is worth saying: it distinguishes
+        # "your pin was wrong" from "there is nothing to pin".
+        problems = resolve_pinned(pinned, catalog).problems
+        return {"tables": [], "scores": {}, "reasons": {}, "strategy": "empty-catalog",
+                "pin_problems": problems}
 
-    forced = resolve_pinned(pinned, catalog)
+    forced, pin_problems = resolve_pinned(pinned, catalog)
 
     # Small database: send everything. Under the cap, pruning can only lose information and
     # saves nothing worth having, so small databases behave exactly as they did before pruning.
@@ -227,7 +256,7 @@ def select_relevant_tables(question: str, catalog: Dict[str, Any],
         reasons = {t: ("pinned with @" if t in forced else "small catalog: all tables sent")
                    for t in ordered}
         return {"tables": ordered, "scores": scores, "reasons": reasons,
-                "strategy": "full-catalog"}
+                "strategy": "full-catalog", "pin_problems": pin_problems}
 
     ranked = [t for t, s in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])) if s > 0]
     if not ranked:
@@ -268,4 +297,5 @@ def select_relevant_tables(question: str, catalog: Dict[str, Any],
     # Pins are honoured even past the cap: the user named those tables explicitly, which is a
     # stronger signal than any heuristic in this file.
     ordered = sorted(selected, key=lambda t: (-scores.get(t, 0.0), t))
-    return {"tables": ordered, "scores": scores, "reasons": reasons, "strategy": "pruned"}
+    return {"tables": ordered, "scores": scores, "reasons": reasons, "strategy": "pruned",
+            "pin_problems": pin_problems}

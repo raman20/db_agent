@@ -311,6 +311,7 @@ class ReplSession:
                         "scores": event.get("scores") or {},
                         "reasons": event.get("reasons") or {},
                         "strategy": event.get("strategy") or "",
+                        "pin_problems": event.get("pin_problems") or [],
                     }
                 elif event.get("event") == "agent_message":
                     name = event.get("agent", "Agent")
