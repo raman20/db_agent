@@ -362,6 +362,11 @@ def main():
     parser.add_argument("--model", help="AI model override (e.g. 'gemini-2.0-flash', 'gpt-4o')")
     parser.add_argument("--api-key", help="API authentication key override")
     parser.add_argument("--base-url", help="Local server endpoint base URL override")
+    parser.add_argument(
+        "--version", action="version",
+        version="schemapilot 0.1.0",
+        help="Show the SchemaPilot version number and exit",
+    )
 
     args = parser.parse_args()
     

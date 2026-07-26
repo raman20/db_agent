@@ -27,10 +27,10 @@ repl:
 	python3 -m schemapilot.cli
 
 test:
-	pytest tests -q --ignore=tests/integration
+	python3 -m pytest tests -q --ignore=tests/integration
 
 test-integration:
-	SCHEMAPILOT_IT=1 pytest tests/integration -q
+	SCHEMAPILOT_IT=1 python3 -m pytest tests/integration -q
 
 clean:
 	rm -rf build/ dist/ *.egg-info/ .pytest_cache/ __pycache__ schemapilot/__pycache__

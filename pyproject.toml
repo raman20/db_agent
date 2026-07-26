@@ -18,7 +18,6 @@ dependencies = [
     "pymysql>=1.1.0",
     "psycopg2-binary>=2.9.0",
     "sqlglot>=30.13,<31",
-    "langchain-community>=0.0.30",
     "langchain-core>=0.1.30",
     "langchain-google-genai>=1.0.0",
     "langchain-openai>=0.1.0",
