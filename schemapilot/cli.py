@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
-import os
 import sys
 import json
 import asyncio
 import argparse
 import uuid
 
-# Add the project root to sys.path to enable importing the 'schemapilot' package
-project_root = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(project_root)
-
-# Load env variables
-from dotenv import load_dotenv
-load_dotenv(os.path.join(project_root, ".env"))
+# Env loading is owned by schemapilot.config, which resolves the .env file the same way
+# no matter which directory the installed `schemapilot` command is invoked from.
+from schemapilot.config import settings
 
 from schemapilot.db import get_db
 from schemapilot.agent import SchemaPilotAgent
+from schemapilot.engines import engine_names, get_spec
 from schemapilot.llm import get_model_manager
+from schemapilot.rendering import print_result_rows
+from schemapilot.repl import ReplSession
+
+# Prompt text per connection field; the set of fields asked for comes from the engine spec.
+FIELD_PROMPTS = {
+    "host": "Enter database host (default: localhost): ",
+    "port": "Enter port (blank for the engine default): ",
+    "username": "Enter database username: ",
+    "password": "Enter database password: ",
+    "database": "Enter target database name: ",
+    "catalog": "Enter Trino catalog (e.g. tpch): ",
+    "schema": "Enter default schema (optional): ",
+    "path": "Enter database file path: ",
+    "http_scheme": "Enter HTTP scheme, http or https (blank to auto-detect): ",
+    "verify": "Enter TLS verification: true, false, or a CA bundle path (optional): ",
+}
 
 # SOTA Terminal visual imports
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
-from rich.text import Text
 
-# SOTA Prompt toolkit imports
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.formatted_text import HTML
+# prompt_toolkit is used by schemapilot.repl, which owns the interactive loop.
+
 
 class SchemaPilotCLI:
     def __init__(self, llm_config=None):
@@ -38,12 +48,8 @@ class SchemaPilotCLI:
         self.db = get_db()
         self.model_manager = get_model_manager()
         self.console = Console()
-        
-        # Setup REPL history session in user's home configuration directory
-        USER_CONFIG_DIR = os.path.expanduser("~/.config/schemapilot")
-        history_file = os.path.join(USER_CONFIG_DIR, ".repl_history")
-        os.makedirs(os.path.dirname(history_file), exist_ok=True)
-        self.session = PromptSession(history=FileHistory(history_file))
+        # The interactive shell (prompt session, history, completion, commands) lives in
+        # schemapilot.repl; this class keeps the argparse-driven, non-interactive surface.
 
     def format_agent_name(self, agent):
         colors = {
@@ -63,7 +69,9 @@ class SchemaPilotCLI:
         if event_type == "agent_message":
             # Direct logging if not wrapped in status status
             agent = event_data.get("agent", "Agent")
-            msg = event_data.get("message", "")
+            # escape(): agent messages quote table names, types and driver text, which routinely
+            # contain square brackets that Rich would read as a style tag and silently delete.
+            msg = escape(str(event_data.get("message", "")))
             self.console.print(f"\n{self.format_agent_name(agent)} {msg}")
             
         elif event_type == "final_output":
@@ -85,23 +93,12 @@ class SchemaPilotCLI:
                 expand=False
             ))
             
-            # Print Raw Data Table
-            if isinstance(raw_data, dict) and "rows" in raw_data and raw_data["rows"]:
-                cols = raw_data.get("columns", [])
-                rows = raw_data.get("rows", [])
-                
-                table = Table(show_header=True, header_style="bold cyan", border_style="dim")
-                for col in cols:
-                    table.add_column(col)
-                
-                # Show top 15 records
-                for row in rows[:15]:
-                    table.add_row(*[str(row.get(col) if row.get(col) is not None else "") for col in cols])
-                    
+            # Print Raw Data Table. The renderer is shared with /sql (schemapilot.rendering) so
+            # both surfaces truncate at the same row and escape cell content identically -- this
+            # path previously printed cells raw, so bracketed database values vanished.
+            if isinstance(raw_data, dict) and raw_data.get("rows"):
                 self.console.print("\n[bold cyan]📋 Results Preview:[/bold cyan]")
-                self.console.print(table)
-                if len(rows) > 15:
-                    self.console.print(f"[dim]* Truncated display preview to 15 of {len(rows)} total rows. *[/dim]")
+                print_result_rows(self.console, raw_data)
 
             # Print Summary MD
             self.console.print("\n[bold green]📊 Analysis Summary:[/bold green]")
@@ -111,7 +108,9 @@ class SchemaPilotCLI:
             self.history.append({"role": "assistant", "content": summary})
             
         elif event_type == "error":
-            err = event_data.get("error", "")
+            # escape(): driver and sentry messages carry brackets (`schemapilot[trino]`, array
+            # literals), and losing part of an error message is how a user fixes the wrong thing.
+            err = escape(str(event_data.get("error", "")))
             self.console.print(f"\n[bold red]❌ Error:[/bold red] {err}", style="red")
 
     async def execute_query(self, query):
@@ -144,46 +143,23 @@ class SchemaPilotCLI:
         except Exception as e:
             self.console.print(f"[bold red]❌ Local Query Execution Error: {e}[/bold red]")
 
+    def build_repl_session(self) -> ReplSession:
+        """Builds the REPL session, wiring this class's Rich renderer into it.
+
+        The renderer is injected rather than duplicated so `schemapilot "question"` and the
+        interactive shell print results identically.
+        """
+        return ReplSession(
+            db=self.db,
+            console=self.console,
+            model_manager=self.model_manager,
+            llm_config=self.llm_config,
+            event_renderer=self.handle_event,
+        )
+
     def interactive_shell(self):
-        # Fetch active connection details
-        active_db = "None"
-        for conn in self.db.get_connections_list():
-            if conn["is_active"]:
-                active_db = f"{conn['name']} ({conn['db_type'].upper()})"
-                
-        # Fetch active model profile details
-        active_model = "Default (.env)"
-        active_profile = self.model_manager.get_active_profile()
-        if self.model_manager.active_id:
-            active_model = f"{self.model_manager.active_id} ({active_profile.get('model_name')})"
-                
-        self.console.print(Panel(
-            Text.assemble(
-                ("SchemaPilot Console CLI (Local Only)\n", "bold blue"),
-                ("Database Connection: ", "bold"), (f"{active_db}\n", "green"),
-                ("AI Model Profile:   ", "bold"), (f"{active_model}", "green")
-            ),
-            border_style="blue",
-            expand=False
-        ))
-        
-        self.console.print("Type your database query. Press [bold]Up/Down[/bold] for history. Type '[bold]exit[/bold]' to quit.")
-        
-        while True:
-            try:
-                # SOTA Prompt prompt_toolkit session
-                query = self.session.prompt(HTML("<cyan><b>🤔 Ask SchemaPilot &gt; </b></cyan>")).strip()
-                if not query:
-                    continue
-                if query.lower() in ["exit", "quit"]:
-                    self.console.print("\nGoodbye! 👋")
-                    break
-                asyncio.run(self.execute_query(query))
-            except KeyboardInterrupt:
-                self.console.print("\nGoodbye! 👋")
-                break
-            except Exception as e:
-                self.console.print(f"[bold red]❌ Error: {e}[/bold red]")
+        """Launches the REPL (schemapilot.repl owns the loop, commands and completion)."""
+        self.build_repl_session().run()
 
     # ----------------------------------------------------
     # Database Connection Profile Management
@@ -197,22 +173,25 @@ class SchemaPilotCLI:
             print("❌ Connection name is required.")
             return
 
-        db_type = input("Enter database dialect (postgres, mysql, sqlite): ").strip().lower()
-        if db_type not in ["postgres", "mysql", "sqlite"]:
-            print("❌ Invalid dialect. Only postgres, mysql, and sqlite are supported.")
+        db_type = input(f"Enter database dialect ({', '.join(engine_names())}): ").strip().lower()
+        try:
+            spec = get_spec(db_type)
+        except ValueError as e:
+            print(f"❌ {e}")
             return
 
-        config = {"name": name, "db_type": db_type}
-        
-        if db_type != "sqlite":
-            config["host"] = input("Enter database host (default: localhost): ").strip() or "localhost"
-            port_input = input(f"Enter port (default: {'5432' if db_type == 'postgres' else '3306'}): ").strip()
-            config["port"] = int(port_input) if port_input else (5432 if db_type == "postgres" else 3306)
-            config["username"] = input("Enter database username: ").strip()
-            config["password"] = input("Enter database password: ").strip()
-            config["database"] = input("Enter target database name: ").strip()
-        else:
-            config["database"] = input("Enter SQLite database file path: ").strip()
+        config = {"name": name, "db_type": spec.name}
+
+        # Prompt for exactly the fields the spec declares. Never inferred from sql_name_parts:
+        # DuckDB has 3-part SQL names but connects via a file path.
+        for field in spec.connection_fields:
+            value = input(FIELD_PROMPTS.get(field, f"Enter {field}: ")).strip()
+            if field == "port":
+                config["port"] = int(value) if value else spec.default_port
+            elif field == "host":
+                config["host"] = value or "localhost"
+            elif value:
+                config[field] = value
 
         self.console.print("\n⏳ Testing connection parameters...")
         success, message = self.db.test_connection(config)
@@ -242,19 +221,23 @@ class SchemaPilotCLI:
         
         for conn in conns:
             status = "[bold green]ACTIVE[/bold green]" if conn["is_active"] else ""
-            host_str = f"{conn['host']}:{conn['port']} / {conn['database']}" if conn["db_type"] != "sqlite" else conn["database"]
-            table.add_row(status, conn["id"], conn["name"], conn["db_type"].upper(), host_str)
+            # File-backed engines describe themselves with a path; server engines with host/port.
+            if conn.get("path"):
+                target = conn["path"]
+            elif conn.get("host"):
+                target = f"{conn['host']}:{conn['port']} / {conn.get('catalog') or conn.get('database') or ''}"
+            else:
+                target = conn.get("database") or ""
+            table.add_row(status, conn["id"], conn["name"], str(conn["db_type"] or "?").upper(), target)
             
         self.console.print(table)
 
     def select_connection(self, conn_id):
         """Activates target connection profile."""
         try:
+            # select_connection now persists the active flag itself.
             success = self.db.select_connection(conn_id)
             if success:
-                for cid in self.db.connections:
-                    self.db.connections[cid]["is_active"] = (cid == conn_id)
-                self.db.save_connections()
                 self.console.print(f"[bold green]✅ Switched active database connection profile to: {conn_id}[/bold green]")
             else:
                 self.console.print(f"[bold red]❌ Connection profile ID '{conn_id}' not found.[/bold red]", style="red")
@@ -281,9 +264,9 @@ class SchemaPilotCLI:
             print("❌ Profile identifier is required.")
             return
 
-        provider = input("Select provider (google, openai, anthropic, local): ").strip().lower()
-        if provider not in ["google", "openai", "anthropic", "local"]:
-            print("❌ Invalid provider. Select google, openai, anthropic, or local.")
+        provider = input("Select provider (google, openai, anthropic, openai-compatible, ollama, local): ").strip().lower().replace("_", "-")
+        if provider not in ["google", "openai", "anthropic", "openai-compatible", "ollama", "local"]:
+            print("❌ Invalid provider. Select google, openai, anthropic, openai-compatible, ollama, or local.")
             return
 
         model_name = input("Enter model name (e.g. gemini-2.0-flash, gpt-4o, llama3): ").strip()
@@ -298,11 +281,14 @@ class SchemaPilotCLI:
             "base_url": ""
         }
 
-        if provider != "local":
-            config["api_key"] = input("Enter API authentication key: ").strip()
-        else:
+        if provider in ("local", "ollama"):
             config["base_url"] = input("Enter local server base URL (e.g. http://localhost:11434/v1): ").strip()
             config["api_key"] = input("Enter API key (optional for local): ").strip()
+        elif provider == "openai-compatible":
+            config["base_url"] = input("Enter OpenAI-compatible base URL (e.g. http://localhost:8765/v1): ").strip()
+            config["api_key"] = input("Enter API authentication key: ").strip()
+        else:
+            config["api_key"] = input("Enter API authentication key: ").strip()
 
         self.model_manager.add_profile(profile_id, config)
         if not self.model_manager.active_id:
@@ -393,10 +379,13 @@ def main():
         if not llm_config:
             print("\033[91m❌ Error: Specify at least one LLM parameter (--provider, --model, --api-key, or --base-url) to save.\033[0m", file=sys.stderr)
             return
-        from schemapilot.llm import save_llm_config, load_saved_llm_config
-        existing = load_saved_llm_config()
+        manager = get_model_manager()
+        profile_id = "default"
+        existing = dict(manager.profiles.get(profile_id, {}))
+        existing.pop("is_active", None)
         merged = {**existing, **llm_config}
-        save_llm_config(merged)
+        manager.add_profile(profile_id, merged)
+        manager.select_profile(profile_id)
         print("\033[92m✅ Saved LLM settings successfully as default configuration profile!\033[0m")
         return
 
@@ -423,12 +412,8 @@ def main():
     elif args.query:
         asyncio.run(cli.execute_query(args.query))
     else:
-        # If no flags are passed, launch REPL
-        has_action = any([args.add_conn, args.list_conns, args.select_conn, args.delete_conn,
-                          args.add_model, args.list_models, args.select_model, args.delete_model,
-                          args.save_llm])
-        if not has_action:
-            cli.interactive_shell()
+        # Every flag is handled by a branch above, so reaching here means none was passed.
+        cli.interactive_shell()
 
 if __name__ == "__main__":
     main()

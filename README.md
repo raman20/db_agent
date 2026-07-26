@@ -1,15 +1,39 @@
 # SchemaPilot
 
-SchemaPilot is an interactive, local-only terminal CLI copilot for relational databases. It translates natural language questions into secure, optimized SQL, executes them against your target database, and returns formatted analysis and tabular results directly in your console. 
+SchemaPilot is an interactive, local-only terminal CLI copilot for anything that speaks SQL. It
+translates natural language questions into validated SQL, executes them against your target
+engine, and returns formatted analysis and tabular results directly in your console.
 
-It is designed to run completely on your local machine, using either cloud LLMs (Gemini, OpenAI, Claude) or local offline models (Ollama, LlamaEdge) without requiring any web server wrappers.
+It is designed to run completely on your local machine, using either cloud LLMs (Gemini, OpenAI,
+Claude) or local offline models (Ollama, LlamaEdge) without requiring any web server wrappers.
+
+## Supported engines
+
+| Engine | Install | Notes |
+|---|---|---|
+| PostgreSQL | included | |
+| MySQL | included | |
+| SQLite | included | file path, no server |
+| DuckDB | `pip install 'schemapilot[duckdb]'` | file path or `:memory:`; no PK metadata via reflection |
+| Trino | `pip install 'schemapilot[trino]'` | 3-part `catalog.schema.table` names; no FK metadata |
+| ClickHouse | `pip install 'schemapilot[clickhouse]'` | no FK metadata |
+
+`pip install 'schemapilot[all]'` installs every optional driver. Each engine is described by a
+declarative spec in `schemapilot/engines/`, so adding another SQL-speaking engine is a small
+data file rather than a refactor. All six above are verified against real servers in CI-style
+integration tests (`make test-integration`), not contract tests alone.
+
+Run `/engines` inside the REPL to see which drivers are installed and the exact `pip` command
+for any that are missing.
 
 ## Core Features
 
 * **Interactive REPL Shell:** A persistent query shell with up/down arrow command history search (backed by `prompt_toolkit`).
 * **Global Model Profiles:** Manage credentials for multiple LLMs and switch active models dynamically.
-* **Global Database Profiles:** Manage credentials for MySQL, PostgreSQL, and SQLite databases.
-* **AST SQL Security Sentry:** Validates query safety prior to execution using Abstract Syntax Tree (AST) analysis via `sqlglot` to block destructive DDL/DML mutations.
+* **Global Database Profiles:** Manage credentials for all six supported engines.
+* **AST SQL Security Sentry:** Validates query safety prior to execution using Abstract Syntax Tree (AST) analysis via `sqlglot`. It is a per-engine *allowlist*: anything it does not positively recognise as read-only is refused. See [Security model](#security-model) for what that does and does not protect.
+* **Schema-aware REPL:** Eight slash commands (`/help`, `/use`, `/engines`, `/tables`, `/schema`, `/sql`, `/why`, `/exit`) with tab completion over your real table names, plus `@table` to pin a table into the prompt.
+* **Token-cost controls:** Prompts carry compact metadata rather than full DDL, tables are shortlisted lexically with one hop of foreign-key expansion, and sample data rows are **opt-in per connection** rather than sent by default.
 * **Dynamic Step Log Spinner:** Employs `rich` console status spinners to track agent states (Architect, Programmer, Sentry, Executor, Analyst) in real time.
 * **Formatted Outputs:** Visualizes database queries using SQL syntax-highlighting panels, markdown tables, and formatted terminal data grids.
 
@@ -26,13 +50,18 @@ schema-pilot/
 │   ├── security.py        # SQL AST validation rules
 │   ├── llm.py             # LLM profiles registry (~/.config/schemapilot/models.json)
 │   └── agent.py           # SQL generation and evaluation pipeline
+│   ├── cli.py             # CLI entrypoint driver (schemapilot.cli:main)
+│   ├── catalog.py         # In-memory schema cache (sole owner of metadata)
+│   ├── pruning.py         # Lexical table shortlisting for prompts
+│   ├── engines/           # Declarative EngineSpec per supported engine
+│   └── repl/              # Session, command dispatch, completion
 ├── tests/                 # Unit tests
-│   └── test_security.py   # Security AST test suite
-├── cli.py                 # CLI entrypoint driver
+│   ├── test_security.py   # Security AST test suite
+│   └── integration/       # Live six-engine matrix (SCHEMAPILOT_IT=1)
 ├── pyproject.toml         # Python packaging metadata (PEP 517/621)
 ├── requirements.txt       # Project dependencies
 ├── Makefile               # Task runner definitions
-└── docker-compose.yml     # Local database sandboxes (MySQL, Postgres)
+└── docker-compose.yml     # Local sandboxes (Postgres, MySQL, Trino, ClickHouse)
 ```
 
 ---
@@ -40,10 +69,11 @@ schema-pilot/
 ## Setup & Quickstart
 
 ### 1. Initialize Sandbox Databases
-Spin up the PostgreSQL and MySQL sandbox containers:
+Spin up the PostgreSQL, MySQL, Trino and ClickHouse sandbox containers:
 ```bash
 make sandbox
 ```
+*Trino takes 30-60 seconds to become healthy on a cold start.*
 
 ### 2. Local Installation
 Install the project in editable mode to register the `schemapilot` binary globally in your shell path:
@@ -52,7 +82,9 @@ make install
 ```
 
 ### 3. Add a Database Connection Profile
-Configure a connection profile for PostgreSQL, MySQL, or SQLite:
+Configure a connection profile for any supported engine. SchemaPilot prompts only for the fields
+that engine actually needs — a file path for SQLite/DuckDB, host/port/credentials for the rest,
+plus catalog and schema for Trino:
 ```bash
 schemapilot --add-conn
 ```
@@ -91,6 +123,22 @@ Start the persistent prompt shell:
 schemapilot
 ```
 
+Inside the shell, bare text is a natural-language question. Slash commands:
+
+| Command | What it does |
+|---|---|
+| `/help [cmd]` | List commands, or explain one |
+| `/use <name>` | Switch active connection and warm its schema cache |
+| `/engines` | Driver status per engine, and the exact `pip` fix if one is missing |
+| `/tables [glob]` | List tables, optionally filtered |
+| `/schema [table]` | Schema tree with primary-key and foreign-key markers |
+| `/sql <raw>` | Run raw SQL with no LLM — still checked by the sentry |
+| `/why` | Explain which tables were shortlisted for the last question, and why |
+| `/exit` | Leave the shell |
+
+Typing `@` in a question completes a table name **and pins that table** into the prompt, which is
+the fastest way to correct a wrong table choice.
+
 ### Direct Arguments Override
 Override active profile configurations for a single execution:
 ```bash
@@ -124,9 +172,51 @@ options:
 
 ---
 
+## Credential Storage
+
+Connection profiles live in `~/.config/schemapilot/connections.json` and model profiles in
+`~/.config/schemapilot/models.json`. **Both store secrets in plaintext at rest** — database
+passwords and LLM API keys respectively.
+
+SchemaPilot mitigates this as far as file permissions allow: the directory is created `0700`
+and both files are written atomically with mode `0600`, so they are readable only by your user
+account. That is *not* encryption — anything running as your user can read them, and so can
+anyone with your backups. Prefer least-privilege, read-only database credentials.
+
+Storing secrets in the OS keyring (Keychain / Secret Service / Credential Manager) is planned
+future work.
+
+---
+
+## Security model
+
+The sentry is a **DDL/DML guard, not a sandbox.** It parses every statement with `sqlglot` and
+refuses anything it cannot positively classify as read-only for the active engine, which blocks
+`DROP`, `ALTER`, `CREATE`, `TRUNCATE`, `MERGE`, `GRANT`, `ATTACH`, `SELECT ... INTO`, multi-statement
+payloads such as `SELECT 1; DROP TABLE users`, and per-engine hazards like ClickHouse's
+`SYSTEM`/`OPTIMIZE` or DuckDB's `read_csv()`.
+
+What it deliberately does **not** claim:
+
+* **It is not containment.** Read-shaped SQL can still reach the filesystem or network through
+  engine table functions. SchemaPilot blocks the ones it knows about, which raises the bar but is
+  not a boundary. **Least-privilege, read-only database credentials are the real control.**
+* **`EXPLAIN` is refused on every engine.** This is intentional: on PostgreSQL,
+  `EXPLAIN ANALYZE DELETE FROM users` genuinely executes the delete, and the statement's contents
+  are invisible to the parser. Allowing `EXPLAIN` by keyword would let a read-only session
+  modify data.
+* **The v1 REPL never writes.** Every query runs with mutations disabled, regardless of
+  configuration. Interactive mutation approval is planned future work.
+
 ## Development & Testing
 
-Run the security sentinel test suite:
+Run the unit suite:
 ```bash
-PYTHONPATH=. pytest
+make test
+```
+
+Run the live six-engine integration matrix (requires `make sandbox` first; skipped unless
+`SCHEMAPILOT_IT=1`):
+```bash
+make test-integration
 ```
