@@ -1,5 +1,9 @@
 # SchemaPilot
 
+[![CI](https://github.com/raman20/SchemaPilot/actions/workflows/ci.yml/badge.svg)](https://github.com/raman20/SchemaPilot/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 SchemaPilot is an interactive, local-only terminal CLI copilot for anything that speaks SQL. It
 translates natural language questions into validated SQL, executes them against your target
 engine, and returns formatted analysis and tabular results directly in your console.
@@ -25,6 +29,39 @@ integration tests (`make test-integration`), not contract tests alone.
 
 Run `/engines` inside the REPL to see which drivers are installed and the exact `pip` command
 for any that are missing.
+
+## Demo
+
+```
+❯ /engines
+┏━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃   ┃ Engine     ┃ Driver    ┃ Safe dry-run ┃ Cross-engine reach        ┃ Fix / note ┃
+┡━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│   │ ClickHouse │ installed │ unavailable  │ —                         │            │
+│   │ DuckDB     │ installed │ available    │ —                         │            │
+│   │ MySQL      │ installed │ available    │ —                         │            │
+│   │ PostgreSQL │ installed │ available    │ —                         │            │
+│ ● │ SQLite     │ installed │ available    │ —                         │            │
+│   │ Trino      │ installed │ unavailable  │ configured Trino catalogs │            │
+└───┴────────────┴───────────┴──────────────┴───────────────────────────┴────────────┘
+
+❯ /schema customers
+customers
+├── id: INTEGER (PK)
+├── name: TEXT NOT NULL
+└── country: TEXT
+
+❯ /sql SELECT id, name FROM customers LIMIT 3
+┏━━━━┳━━━━━━━┓
+┃ id ┃ name  ┃
+┡━━━━╇━━━━━━━┩
+│ 1  │ Alice │
+│ 2  │ Bob   │
+│ 3  │ Carol │
+└────┴───────┘
+```
+
+See the full transcript at [docs/demo.txt](docs/demo.txt).
 
 ## Core Features
 
@@ -75,10 +112,19 @@ make sandbox
 ```
 *Trino takes 30-60 seconds to become healthy on a cold start.*
 
-### 2. Local Installation
-Install the project in editable mode to register the `schemapilot` binary globally in your shell path:
+### 2. Install
+
 ```bash
-make install
+# Recommended: pipx (isolated environment, auto-PATH)
+pipx install schemapilot          # base install
+pipx install 'schemapilot[all]'   # all engines
+
+# Or: pip
+pip install schemapilot
+pip install 'schemapilot[all]'
+
+# Or: from source
+git clone https://github.com/raman20/SchemaPilot.git && cd SchemaPilot && make install
 ```
 
 ### 3. Add a Database Connection Profile
@@ -91,7 +137,7 @@ schemapilot --add-conn
 *Follow the interactive prompt. On save, SchemaPilot will automatically test database connectivity.*
 
 ### 4. Add an AI Model Profile
-Add credentials for Gemini, OpenAI, Claude, or a local Ollama server:
+Add credentials for Gemini, OpenAI, Claude, an OpenAI-compatible endpoint, or Ollama:
 ```bash
 schemapilot --add-model
 ```
@@ -168,7 +214,16 @@ options:
   --model MODEL         AI model name override (e.g. gemini-2.0-flash, gpt-4o)
   --api-key API_KEY     API authentication key override
   --base-url BASE_URL   Local server endpoint base URL override (Ollama / LM Studio)
+  --version             Show the SchemaPilot version number and exit
+  --install-completion  Print shell eval line for tab completion (bash / zsh)
 ```
+
+## Documentation
+
+- [Usage guide](docs/usage.md) — quickstart, REPL commands, @table pinning
+- [Engine reference](docs/engines.md) — setup per engine, pip extras, quirks
+- [Security model](docs/security.md) — what the sentry blocks and what it does not
+- [Contributing](CONTRIBUTING.md) — how to add an engine, PR checklist
 
 ---
 

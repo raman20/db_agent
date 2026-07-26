@@ -1,0 +1,48 @@
+
+❯ /engines
+┏━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃   ┃ Engine     ┃ Driver    ┃ Safe dry-run ┃ Cross-engine reach        ┃ Fix / note ┃
+┡━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│   │ ClickHouse │ installed │ unavailable  │ —                         │            │
+│   │ DuckDB     │ installed │ available    │ —                         │            │
+│   │ MySQL      │ installed │ available    │ —                         │            │
+│   │ PostgreSQL │ installed │ available    │ —                         │            │
+│ ● │ SQLite     │ installed │ available    │ —                         │            │
+│   │ Trino      │ installed │ unavailable  │ configured Trino catalogs │            │
+└───┴────────────┴───────────┴──────────────┴───────────────────────────┴────────────┘
+'Safe dry-run' is SchemaPilot's own guarantee, not the engine's transaction support. This session is read-only regardless.
+
+❯ /tables
+  customers
+  orders
+2 table(s) · 2 tables cached
+
+❯ /schema customers
+customers
+├── id: INTEGER (PK)
+├── name: TEXT NOT NULL
+└── country: TEXT
+
+❯ /sql SELECT id, name FROM customers LIMIT 3
+┏━━━━┳━━━━━━━┓
+┃ id ┃ name  ┃
+┡━━━━╇━━━━━━━┩
+│ 1  │ Alice │
+│ 2  │ Bob   │
+│ 3  │ Carol │
+└────┴───────┘
+
+❯ /help
+┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Command         ┃ What it does                                               ┃
+┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ /help [cmd]     │ Show commands, or detail for one.                          │
+│ /use <name>     │ Switch connection and warm the schema cache.               │
+│ /engines        │ Driver status and SchemaPilot's policy per engine.         │
+│ /tables [glob]  │ List cached tables, optionally glob-filtered.              │
+│ /schema [table] │ Tree of schemas, tables and columns (PK/FK marked).        │
+│ /sql <raw>      │ Run raw SQL with no LLM (still sentry-checked, read-only). │
+│ /why            │ Explain which tables the last question used.               │
+│ /exit           │ Leave SchemaPilot.                                         │
+└─────────────────┴────────────────────────────────────────────────────────────┘
+Bare text is a natural-language question. @table pins a table so the next question definitely sees it. This session is read-only.

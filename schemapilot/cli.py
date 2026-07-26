@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
+import os
 import sys
 import json
 import asyncio
@@ -338,6 +340,25 @@ class SchemaPilotCLI:
             self.console.print(f"[bold red]❌ AI Model profile ID '{profile_id}' not found.[/bold red]", style="red")
 
 
+def _print_completion_instructions():
+    """Print shell-specific eval lines for argcomplete tab completion."""
+    shell = os.environ.get("SHELL", "")
+    if "zsh" in shell:
+        print(
+            "# Add this to ~/.zshrc to enable tab completion for schemapilot:\n"
+            'eval "$(register-python-argcomplete schemapilot)"'
+        )
+    else:
+        print(
+            "# Add this to ~/.bashrc to enable tab completion for schemapilot:\n"
+            'eval "$(register-python-argcomplete schemapilot)"'
+        )
+    print()
+    print("After adding, restart your shell or run:  source ~/.bashrc")
+    print()
+    print("Requires:  pip install argcomplete")
+
+
 def main():
     parser = argparse.ArgumentParser(description="SchemaPilot Terminal CLI Database Client (Local-only)")
     parser.add_argument("query", nargs="?", help="A single query to execute against the database")
@@ -367,6 +388,16 @@ def main():
         version="schemapilot 0.1.0",
         help="Show the SchemaPilot version number and exit",
     )
+    parser.add_argument(
+        "--install-completion", action="store_true",
+        help="Print shell eval line for tab completion (bash / zsh)",
+    )
+
+    try:
+        import argcomplete
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
 
     args = parser.parse_args()
     
@@ -380,6 +411,9 @@ def main():
     cli = SchemaPilotCLI(llm_config=llm_config)
     
     # Evaluate connection and config management actions
+    if args.install_completion:
+        _print_completion_instructions()
+        return
     if args.save_llm:
         if not llm_config:
             print("\033[91m❌ Error: Specify at least one LLM parameter (--provider, --model, --api-key, or --base-url) to save.\033[0m", file=sys.stderr)
