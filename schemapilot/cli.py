@@ -264,9 +264,9 @@ class SchemaPilotCLI:
             print("❌ Profile identifier is required.")
             return
 
-        provider = input("Select provider (google, openai, anthropic, local): ").strip().lower()
-        if provider not in ["google", "openai", "anthropic", "local"]:
-            print("❌ Invalid provider. Select google, openai, anthropic, or local.")
+        provider = input("Select provider (google, openai, anthropic, openai-compatible, ollama, local): ").strip().lower().replace("_", "-")
+        if provider not in ["google", "openai", "anthropic", "openai-compatible", "ollama", "local"]:
+            print("❌ Invalid provider. Select google, openai, anthropic, openai-compatible, ollama, or local.")
             return
 
         model_name = input("Enter model name (e.g. gemini-2.0-flash, gpt-4o, llama3): ").strip()
@@ -281,11 +281,14 @@ class SchemaPilotCLI:
             "base_url": ""
         }
 
-        if provider != "local":
-            config["api_key"] = input("Enter API authentication key: ").strip()
-        else:
+        if provider in ("local", "ollama"):
             config["base_url"] = input("Enter local server base URL (e.g. http://localhost:11434/v1): ").strip()
             config["api_key"] = input("Enter API key (optional for local): ").strip()
+        elif provider == "openai-compatible":
+            config["base_url"] = input("Enter OpenAI-compatible base URL (e.g. http://localhost:8765/v1): ").strip()
+            config["api_key"] = input("Enter API authentication key: ").strip()
+        else:
+            config["api_key"] = input("Enter API authentication key: ").strip()
 
         self.model_manager.add_profile(profile_id, config)
         if not self.model_manager.active_id:

@@ -140,7 +140,7 @@ def get_llm(config_override: Dict[str, Any] = None):
                 val = config_override.get(key) or config_override.get(f"llm_{key}")
                 config[key] = val
 
-    provider = str(config.get("provider", "google")).lower().strip()
+    provider = str(config.get("provider", "google")).lower().strip().replace("_", "-")
     model_name = str(config.get("model_name", "gemini-2.0-flash"))
     api_key = config.get("api_key", "")
     base_url = config.get("base_url", "")
@@ -198,5 +198,5 @@ def get_llm(config_override: Dict[str, Any] = None):
     else:
         raise ValueError(
             f"Unsupported LLM provider '{provider}'. "
-            "Supported providers: google, openai, anthropic, local, ollama"
+            "Supported providers: google, openai, anthropic, openai-compatible, local, ollama"
         )
